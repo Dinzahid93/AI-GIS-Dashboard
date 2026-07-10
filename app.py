@@ -1516,7 +1516,28 @@ if st.session_state.route_result is not None:
 
 
 # ============================================================
-# 16. ROUTE RESULTS
+# 16. DISPLAY MAP
+# ============================================================
+
+campus_map = create_map(
+    route_result=st.session_state.route_result,
+    route_legs=st.session_state.route_legs,
+    total_distance=st.session_state.total_distance,
+    building_ids=st.session_state.selected_building_ids,
+)
+
+st_folium(
+    campus_map,
+    width=None,
+    height=720,
+    returned_objects=[],
+    use_container_width=True,
+    key="main_campus_map",
+)
+
+
+# ============================================================
+# 17. ROUTE RESULTS
 # ============================================================
 
 if (
@@ -1593,25 +1614,3 @@ if (
                 unsafe_allow_html=True,
             )
 
-
-# ============================================================
-# 17. DISPLAY MAP
-# ============================================================
-
-campus_map = create_map(
-    route_result=st.session_state.route_result,
-    route_legs=st.session_state.route_legs,
-    total_distance=st.session_state.total_distance,
-    building_ids=(
-        st.session_state
-        .selected_building_ids
-    ),
-)
-
-st_folium(
-    campus_map,
-    width=None,
-    height=720,
-    returned_objects=[],
-    use_container_width=True,
-)
