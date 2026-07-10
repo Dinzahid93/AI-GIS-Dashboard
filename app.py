@@ -7,6 +7,7 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 import streamlit as st
+from ai_engine import interpret_gis_command
 
 from branca.element import MacroElement
 from folium.plugins import Fullscreen
@@ -115,6 +116,12 @@ if "selected_building_ids" not in st.session_state:
 
 if "last_question" not in st.session_state:
     st.session_state.last_question = ""
+
+if "last_ai_reply" not in st.session_state:
+    st.session_state.last_ai_reply = ""
+
+if "last_interpreter" not in st.session_state:
+    st.session_state.last_interpreter = ""
 
 
 # ============================================================
@@ -1325,26 +1332,31 @@ if st.button(
 
 
 # ============================================================
-# 14. COMMAND FORM
+# 14. GEMINI AI GIS ASSISTANT
 # ============================================================
 
-st.subheader("Ask the GIS")
+st.subheader("AI GIS Assistant")
+
+st.caption(
+    "Gemini interprets your request and extracts the building FIDs. "
+    "The GIS engine performs the actual shortest-path analysis."
+)
 
 with st.form(
     key="gis_command_form",
     clear_on_submit=False,
 ):
     question = st.text_input(
-        "Enter a route command",
+        "Enter a route request",
         value=st.session_state.last_question,
         placeholder=(
-            "Example: route from building 10 "
-            "to building 20 to building 35"
+            "Example: Start at Building 10, visit Building 20, "
+            "then Building 35, and return to Building 10"
         ),
     )
 
     submitted = st.form_submit_button(
-        "Run GIS command",
+        "Run AI GIS command",
         type="primary",
     )
 
@@ -1353,62 +1365,115 @@ if submitted:
     st.session_state.last_question = question
 
     if not question.strip():
-        st.warning(
-            "Please enter a route command."
-        )
+        st.warning("Please enter a route request.")
 
     else:
-        parsed = parse_command(question)
+        parsed = None
+        interpreter_used = ""
 
-        if parsed["action"] == "route":
-            building_ids = parsed[
-                "building_ids"
+        # First choice: real Gemini interpretation.
+        try:
+            gemini_key = str(
+                st.secrets.get("GEMINI_API_KEY", "")
+            ).strip()
+
+            if not gemini_key:
+                raise ValueError(
+                    "GEMINI_API_KEY is missing from Streamlit Secrets."
+                )
+
+            with st.spinner("Gemini is interpreting your request..."):
+                parsed = interpret_gis_command(
+                    question=question,
+                    api_key=gemini_key,
+                )
+
+            interpreter_used = "Gemini"
+
+        except Exception as gemini_error:
+            # Safe fallback: the older number-and-keyword parser.
+            parsed = parse_command(question)
+            interpreter_used = "Rule-based fallback"
+
+            st.warning(
+                "Gemini was unavailable, so the app used the "
+                f"rule-based fallback. Details: {gemini_error}"
+            )
+
+        st.session_state.last_interpreter = interpreter_used
+        st.session_state.last_ai_reply = str(
+            parsed.get("reply", "")
+        ).strip()
+
+        if parsed.get("action") == "route":
+            building_ids = [
+                int(building_id)
+                for building_id in parsed.get(
+                    "building_ids",
+                    [],
+                )
             ]
 
-            try:
-                with st.spinner(
-                    "Calculating shortest route..."
-                ):
-                    (
-                        route_result,
-                        route_legs,
-                        total_distance,
-                    ) = calculate_multi_stop_route(
+            if len(building_ids) < 2:
+                st.warning(
+                    "Please provide at least two building FIDs."
+                )
+
+            else:
+                try:
+                    with st.spinner(
+                        "Running GIS shortest-path analysis..."
+                    ):
+                        (
+                            route_result,
+                            route_legs,
+                            total_distance,
+                        ) = calculate_multi_stop_route(
+                            building_ids
+                        )
+
+                    st.session_state.route_result = route_result
+                    st.session_state.route_legs = route_legs
+                    st.session_state.total_distance = total_distance
+                    st.session_state.selected_building_ids = (
                         building_ids
                     )
 
-                st.session_state.route_result = (
-                    route_result
-                )
+                    if st.session_state.last_ai_reply:
+                        st.info(
+                            st.session_state.last_ai_reply
+                        )
 
-                st.session_state.route_legs = (
-                    route_legs
-                )
+                    st.success(
+                        "Route calculated successfully using "
+                        f"{interpreter_used} for language interpretation "
+                        "and the GIS engine for network analysis."
+                    )
 
-                st.session_state.total_distance = (
-                    total_distance
-                )
-
-                st.session_state.selected_building_ids = (
-                    building_ids
-                )
-
-                st.success(
-                    "Route calculated successfully."
-                )
-
-            except Exception as error:
-                st.error(
-                    f"Unable to calculate route: "
-                    f"{error}"
-                )
+                except Exception as error:
+                    st.error(
+                        "Unable to calculate route: "
+                        f"{error}"
+                    )
 
         else:
+            if st.session_state.last_ai_reply:
+                st.info(
+                    st.session_state.last_ai_reply
+                )
+
             st.warning(
-                "Command not recognised. Try: "
-                "'route from building 10 "
-                "to building 20'."
+                "The request was not recognised as a route request. "
+                "Try: 'Find the shortest route from Building 10 "
+                "to Building 20'."
             )
+
+
+if st.session_state.last_interpreter:
+    st.caption(
+        f"Last language interpreter used: "
+        f"{st.session_state.last_interpreter}"
+    )
 
 
 # ============================================================
@@ -1422,6 +1487,8 @@ if st.session_state.route_result is not None:
         st.session_state.total_distance = None
         st.session_state.selected_building_ids = None
         st.session_state.last_question = ""
+        st.session_state.last_ai_reply = ""
+        st.session_state.last_interpreter = ""
         st.rerun()
 
 
