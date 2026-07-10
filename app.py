@@ -14,6 +14,12 @@ from jinja2 import Template
 from scipy.spatial import cKDTree
 from shapely.geometry import LineString
 from streamlit_folium import st_folium
+from building_manager import (
+    ensure_name_column,
+    building_display_label,
+    update_building_name_locally,
+    save_building_names_to_github,
+)
 
 
 # ============================================================
@@ -165,11 +171,17 @@ except Exception as error:
     st.error(f"Could not load GIS data: {error}")
     st.stop()
 
+# Ensure every building has a clean NAME field.
+buildings = ensure_name_column(buildings)
 
-buildings_wgs = buildings.to_crs(WEB_CRS)
+buildings_wgs = ensure_name_column(
+    buildings.to_crs(WEB_CRS)
+)
 roads_wgs = roads.to_crs(WEB_CRS)
 
-buildings_m = buildings.to_crs(PROJECTED_CRS)
+buildings_m = ensure_name_column(
+    buildings.to_crs(PROJECTED_CRS)
+)
 roads_m = roads.to_crs(PROJECTED_CRS)
 
 
@@ -494,6 +506,15 @@ def parse_command(question):
     }
 
 
+def get_building_name(building_id):
+    row = buildings[buildings["FID"] == int(building_id)]
+    if row.empty:
+        return f"Building {building_id}"
+
+    name = str(row.iloc[0].get("NAME", "")).strip()
+    return name if name else f"Building {building_id}"
+
+
 # ============================================================
 # 9. TRANSPARENT ORTHOMOSAIC TILE LAYER
 # ============================================================
@@ -737,8 +758,8 @@ def create_map(
             "fillOpacity": 0.38,
         },
         tooltip=folium.GeoJsonTooltip(
-            fields=["FID"],
-            aliases=["Building ID:"],
+            fields=["FID", "NAME"],
+            aliases=["Building ID:", "Building Name:"],
             sticky=True,
         ),
     ).add_to(campus_map)
@@ -762,8 +783,8 @@ def create_map(
         if route_legs:
             for leg in route_legs:
                 leg_text += (
-                    f"{leg['From building']} → "
-                    f"{leg['To building']}: "
+                    f"{get_building_name(leg['From building'])} → "
+                    f"{get_building_name(leg['To building'])}: "
                     f"{leg['Distance (m)']} m<br>"
                 )
 
@@ -830,8 +851,8 @@ def create_map(
             if stop_number == 1:
                 colour = START_COLOUR
                 label = (
-                    f"Start: Building "
-                    f"{building_id}"
+                    f"Start: "
+                    f"{get_building_name(building_id)}"
                 )
 
             elif stop_number == len(
@@ -839,15 +860,15 @@ def create_map(
             ):
                 colour = DESTINATION_COLOUR
                 label = (
-                    f"Destination: Building "
-                    f"{building_id}"
+                    f"Destination: "
+                    f"{get_building_name(building_id)}"
                 )
 
             else:
                 colour = INTERMEDIATE_COLOUR
                 label = (
                     f"Stop {stop_number}: "
-                    f"Building {building_id}"
+                    f"{get_building_name(building_id)}"
                 )
 
             folium.GeoJson(
@@ -989,7 +1010,181 @@ with metric3:
 
 
 # ============================================================
-# 12. COMMAND FORM
+# 12. BUILDING NAME EDITOR
+# ============================================================
+
+with st.expander("🏢 Admin Building Name Editor", expanded=False):
+    admin_password = st.text_input(
+        "Admin password",
+        type="password",
+        key="admin_password_input",
+    )
+
+    if admin_password:
+        expected_password = str(
+            st.secrets.get("ADMIN_PASSWORD", "")
+        )
+
+        if admin_password != expected_password:
+            st.error("Incorrect admin password.")
+        else:
+            st.success("Admin access enabled.")
+
+            editor_buildings = buildings.sort_values("FID").copy()
+            editor_options = {
+                building_display_label(row): int(row["FID"])
+                for _, row in editor_buildings.iterrows()
+            }
+
+            selected_editor_label = st.selectbox(
+                "Select building",
+                options=list(editor_options.keys()),
+                key="building_editor_select",
+            )
+
+            selected_editor_fid = editor_options[
+                selected_editor_label
+            ]
+
+            selected_record = buildings[
+                buildings["FID"] == selected_editor_fid
+            ].iloc[0]
+
+            current_name = str(
+                selected_record.get("NAME", "")
+            ).strip()
+
+            st.write(f"**Building FID:** {selected_editor_fid}")
+            st.write(
+                "**Current name:** "
+                + (current_name if current_name else "Unnamed")
+            )
+
+            new_name = st.text_input(
+                "New building name",
+                value=current_name,
+                key=f"new_building_name_{selected_editor_fid}",
+            )
+
+            if st.button(
+                "Save building name",
+                type="primary",
+                key="save_building_name_button",
+            ):
+                try:
+                    updated_buildings = update_building_name_locally(
+                        buildings=buildings,
+                        building_fid=selected_editor_fid,
+                        new_name=new_name,
+                    )
+
+                    save_building_names_to_github(
+                        buildings=updated_buildings,
+                        streamlit_secrets=st.secrets,
+                        building_fid=selected_editor_fid,
+                        new_name=new_name,
+                    )
+
+                    st.success(
+                        f"Saved '{new_name}' for Building "
+                        f"{selected_editor_fid}."
+                    )
+                    st.info(
+                        "GitHub has been updated. The app will "
+                        "redeploy automatically."
+                    )
+                    st.cache_data.clear()
+
+                except Exception as error:
+                    st.error(
+                        f"Unable to save building name: {error}"
+                    )
+
+
+# ============================================================
+# 13. SEARCHABLE BUILDING ROUTE PLANNER
+# ============================================================
+
+st.subheader("Building Route Planner")
+
+route_buildings = buildings.copy()
+route_buildings["display_label"] = route_buildings.apply(
+    building_display_label,
+    axis=1,
+)
+route_buildings = route_buildings.sort_values(
+    ["NAME", "FID"],
+    na_position="last",
+)
+
+building_label_to_fid = dict(
+    zip(
+        route_buildings["display_label"],
+        route_buildings["FID"].astype(int),
+    )
+)
+building_labels = list(building_label_to_fid.keys())
+
+route_col1, route_col2 = st.columns(2)
+
+with route_col1:
+    start_label = st.selectbox(
+        "Start building",
+        options=building_labels,
+        key="start_building_select",
+    )
+
+with route_col2:
+    destination_label = st.selectbox(
+        "Destination building",
+        options=building_labels,
+        index=1 if len(building_labels) > 1 else 0,
+        key="destination_building_select",
+    )
+
+selected_stop_labels = st.multiselect(
+    "Optional intermediate stops",
+    options=building_labels,
+    key="intermediate_stop_select",
+)
+
+if st.button(
+    "Calculate route from selected buildings",
+    type="primary",
+    key="calculate_named_route_button",
+):
+    try:
+        route_ids = [building_label_to_fid[start_label]]
+        route_ids.extend(
+            building_label_to_fid[label]
+            for label in selected_stop_labels
+        )
+        route_ids.append(
+            building_label_to_fid[destination_label]
+        )
+
+        if route_ids[0] == route_ids[-1] and len(route_ids) == 2:
+            raise ValueError(
+                "Start and destination must be different."
+            )
+
+        with st.spinner("Calculating shortest route..."):
+            route_result, route_legs, total_distance = (
+                calculate_multi_stop_route(route_ids)
+            )
+
+        st.session_state.route_result = route_result
+        st.session_state.route_legs = route_legs
+        st.session_state.total_distance = total_distance
+        st.session_state.selected_building_ids = route_ids
+        st.success("Route calculated successfully.")
+
+    except Exception as error:
+        st.error(f"Unable to calculate route: {error}")
+
+
+# ============================================================
+# 14. COMMAND FORM
 # ============================================================
 
 st.subheader("Ask the GIS")
@@ -1076,7 +1271,7 @@ if submitted:
 
 
 # ============================================================
-# 13. CLEAR ROUTE
+# 15. CLEAR ROUTE
 # ============================================================
 
 if st.session_state.route_result is not None:
@@ -1090,7 +1285,7 @@ if st.session_state.route_result is not None:
 
 
 # ============================================================
-# 14. ROUTE RESULTS
+# 16. ROUTE RESULTS
 # ============================================================
 
 if (
@@ -1139,7 +1334,7 @@ if (
 
 
 # ============================================================
-# 15. DISPLAY MAP
+# 17. DISPLAY MAP
 # ============================================================
 
 campus_map = create_map(
