@@ -9,3 +9,4 @@ pyproj
 numpy
 pandas
 requests
+google-genai
