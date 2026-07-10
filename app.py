@@ -145,6 +145,9 @@ if "multi_route_table" not in st.session_state:
 if "multi_route_destination" not in st.session_state:
     st.session_state.multi_route_destination = None
 
+if "independent_route_mode" not in st.session_state:
+    st.session_state.independent_route_mode = None
+
 
 # ============================================================
 # 5. LOAD GIS DATA
@@ -564,31 +567,160 @@ def calculate_routes_from_origins_to_destination(
     return route_results, pd.DataFrame(summary_rows)
 
 
-def parse_multi_origin_command(question):
-    """Recognise requests such as 'routes from 1, 2, 3 and 4 to 444'."""
+
+def calculate_routes_from_origin_to_destinations(
+    origin_id,
+    destination_ids,
+):
+    """Calculate one independent shortest path from one origin to each destination."""
+
+    origin_id = int(origin_id)
+    destination_ids = list(
+        dict.fromkeys(int(fid) for fid in destination_ids)
+    )
+
+    if not destination_ids:
+        raise ValueError("Select at least one destination building.")
+
+    valid_ids = set(buildings_m["FID"].astype(int).tolist())
+    requested_ids = [origin_id] + destination_ids
+    missing_ids = [fid for fid in requested_ids if fid not in valid_ids]
+
+    if missing_ids:
+        raise ValueError(f"Building IDs not found: {missing_ids}")
+
+    destination_ids = [
+        fid for fid in destination_ids
+        if fid != origin_id
+    ]
+
+    if not destination_ids:
+        raise ValueError(
+            "Destinations must be different from the origin."
+        )
+
+    route_results = []
+    summary_rows = []
+
+    for route_number, destination_id in enumerate(
+        destination_ids,
+        start=1,
+    ):
+        route, distance_m, origin_snap, destination_snap = (
+            shortest_route_between_buildings(
+                origin_id,
+                destination_id,
+            )
+        )
+
+        colour = MULTI_ROUTE_COLOURS[
+            (route_number - 1) % len(MULTI_ROUTE_COLOURS)
+        ]
+
+        route = route.copy()
+        route["origin_id"] = origin_id
+        route["destination_id"] = destination_id
+        route["route_label"] = f"{origin_id} → {destination_id}"
+        route["route_colour"] = colour
+        route["distance_m"] = float(distance_m)
+
+        route_results.append(
+            {
+                "origin_id": origin_id,
+                "destination_id": destination_id,
+                "route": route,
+                "distance_m": float(distance_m),
+                "colour": colour,
+            }
+        )
+
+        row = build_standard_route_row(
+            origin_id=origin_id,
+            destination_id=destination_id,
+            distance_m=distance_m,
+        )
+        summary_rows.append(row)
+
+    return route_results, pd.DataFrame(
+        summary_rows,
+        columns=STANDARD_CSV_COLUMNS,
+    )
+
+
+
+def parse_one_origin_multi_destination_command(question):
+    """
+    Recognise explicit one-origin to multiple-destination requests.
+
+    Example:
+    'Show separate shortest paths from Building 10 to Buildings 20, 30 and 40.'
+    """
     text = question.lower().strip()
     numbers = [int(value) for value in re.findall(r"\d+", text)]
 
-    multi_words = [
-        "each", "separate", "individually", "from all",
-        "multiple origins", "every", "respectively",
-    ]
-
-    route_words = ["route", "path", "shortest", "go", "travel", "navigate"]
-
-    looks_multi = len(numbers) >= 3 and (
-        any(word in text for word in multi_words)
-        or ("from" in text and " to " in text)
+    explicit_pattern = re.search(
+        r"from\s+building\s*(\d+).*?to\s+buildings\s+(.+)",
+        text,
     )
 
-    if looks_multi and any(word in text for word in route_words):
+    explicit_words = [
+        "one origin",
+        "multiple destinations",
+        "separate destinations",
+        "each destination",
+    ]
+
+    if len(numbers) >= 3 and (
+        explicit_pattern is not None
+        or any(phrase in text for phrase in explicit_words)
+    ):
+        return {
+            "action": "one_origin_multi_destination",
+            "origin_id": numbers[0],
+            "destination_ids": numbers[1:],
+            "reply": (
+                f"Calculating separate shortest paths from Building "
+                f"{numbers[0]} to Buildings {numbers[1:]}."
+            ),
+        }
+
+    return None
+
+
+def parse_multi_origin_command(question):
+    """
+    Recognise explicit multiple-origin to one-destination requests.
+
+    Example:
+    'Show separate shortest paths from Buildings 1, 2, 3 and 4
+    to Building 444.'
+    """
+    text = question.lower().strip()
+    numbers = [int(value) for value in re.findall(r"\d+", text)]
+
+    explicit_pattern = re.search(
+        r"from\s+buildings\s+(.+?)\s+to\s+building\s*(\d+)",
+        text,
+    )
+
+    explicit_words = [
+        "multiple origins",
+        "each origin",
+        "separate origins",
+        "all origins",
+    ]
+
+    if len(numbers) >= 3 and (
+        explicit_pattern is not None
+        or any(phrase in text for phrase in explicit_words)
+    ):
         return {
             "action": "multi_origin_route",
             "origin_ids": numbers[:-1],
             "destination_id": numbers[-1],
             "reply": (
-                f"Calculating separate shortest paths from {numbers[:-1]} "
-                f"to Building {numbers[-1]}."
+                f"Calculating separate shortest paths from Buildings "
+                f"{numbers[:-1]} to Building {numbers[-1]}."
             ),
         }
 
@@ -659,6 +791,80 @@ def format_duration(total_seconds):
     if minutes > 0:
         return f"{minutes} min {seconds} sec"
     return f"{seconds} sec"
+
+
+
+STANDARD_CSV_COLUMNS = [
+    "From building",
+    "From name",
+    "To building",
+    "To name",
+    "Distance (m)",
+    "Walking",
+    "E-bike",
+    "Motorcycle",
+    "Car driving",
+]
+
+
+def build_standard_route_row(
+    origin_id,
+    destination_id,
+    distance_m,
+):
+    """Create one standard route-result row used by every route mode."""
+
+    distance_m = float(distance_m)
+    distance_km = distance_m / 1000.0
+
+    row = {
+        "From building": int(origin_id),
+        "From name": get_building_name(origin_id),
+        "To building": int(destination_id),
+        "To name": get_building_name(destination_id),
+        "Distance (m)": round(distance_m, 1),
+    }
+
+    for mode_name, speed_kmh in TRAVEL_SPEEDS_KMH.items():
+        travel_seconds = (
+            distance_km / speed_kmh
+        ) * 3600.0
+        row[mode_name] = format_duration(
+            travel_seconds
+        )
+
+    return row
+
+
+def standardise_route_table(route_legs):
+    """
+    Convert single, point-to-point and ordered multi-stop route legs
+    into the same CSV structure used by independent routes.
+    """
+
+    rows = []
+
+    for leg in route_legs or []:
+        rows.append(
+            build_standard_route_row(
+                origin_id=leg["From building"],
+                destination_id=leg["To building"],
+                distance_m=leg["Distance (m)"],
+            )
+        )
+
+    return pd.DataFrame(
+        rows,
+        columns=STANDARD_CSV_COLUMNS,
+    )
+
+
+def route_table_to_csv(route_table):
+    """Return UTF-8 CSV bytes that open cleanly in Excel."""
+
+    return route_table.to_csv(
+        index=False,
+    ).encode("utf-8-sig")
 
 
 def add_direction_arrows(map_object, route_projected):
@@ -1042,24 +1248,58 @@ def create_map(
                     """),
                 ).add_to(campus_map)
 
-        destination_id = int(multi_route_destination)
-        destination_row = buildings_wgs[buildings_wgs["FID"] == destination_id]
-        if not destination_row.empty:
-            destination_point = destination_row.geometry.representative_point().iloc[0]
+        # Add every unique destination marker. This works for both:
+        # multiple origins → one destination, and
+        # one origin → multiple destinations.
+        destination_ids = list(
+            dict.fromkeys(
+                int(result["destination_id"])
+                for result in multi_route_results
+            )
+        )
+
+        for destination_id in destination_ids:
+            destination_row = buildings_wgs[
+                buildings_wgs["FID"] == destination_id
+            ]
+
+            if destination_row.empty:
+                continue
+
+            destination_point = (
+                destination_row.geometry
+                .representative_point()
+                .iloc[0]
+            )
+
             destination_label = (
-                f"Common destination {destination_id}: "
+                f"Destination {destination_id}: "
                 f"{get_building_name(destination_id)}"
             )
+
             folium.Marker(
                 [destination_point.y, destination_point.x],
                 tooltip=destination_label,
                 popup=destination_label,
-                icon=folium.DivIcon(html=f"""
-                    <div style="background:#111827;color:#FDE047;border-radius:8px;
-                    min-width:38px;height:32px;padding:0 7px;text-align:center;
-                    line-height:32px;font-weight:bold;border:2px solid white;
-                    box-shadow:0 1px 6px rgba(0,0,0,.7);">Z:{destination_id}</div>
-                """),
+                icon=folium.DivIcon(
+                    html=f"""
+                    <div style="
+                        background:#111827;
+                        color:#FDE047;
+                        border-radius:8px;
+                        min-width:38px;
+                        height:32px;
+                        padding:0 7px;
+                        text-align:center;
+                        line-height:32px;
+                        font-weight:bold;
+                        border:2px solid white;
+                        box-shadow:0 1px 6px rgba(0,0,0,.7);
+                    ">
+                        D:{destination_id}
+                    </div>
+                    """
+                ),
             ).add_to(campus_map)
 
         if all_route_bounds:
@@ -1620,6 +1860,7 @@ if st.button(
         st.session_state.multi_route_results = None
         st.session_state.multi_route_table = None
         st.session_state.multi_route_destination = None
+        st.session_state.independent_route_mode = None
         st.success("Route calculated successfully.")
 
     except Exception as error:
@@ -1674,6 +1915,7 @@ if st.button(
         st.session_state.multi_route_results = multi_results
         st.session_state.multi_route_table = multi_table
         st.session_state.multi_route_destination = destination_id
+        st.session_state.independent_route_mode = "multiple_origins_one_destination"
 
         # Clear the previous single/ordered route so the modes do not overlap.
         st.session_state.route_result = None
@@ -1688,6 +1930,82 @@ if st.button(
 
     except Exception as error:
         st.error(f"Unable to calculate the separate routes: {error}")
+
+
+
+# ============================================================
+# 15. ONE ORIGIN TO MULTIPLE DESTINATIONS
+# ============================================================
+
+st.subheader("One Origin → Multiple Destinations")
+
+st.caption(
+    "Calculate a separate shortest path from one origin to every "
+    "selected destination. Example: 10 → 20, 10 → 30 and 10 → 40."
+)
+
+one_many_col1, one_many_col2 = st.columns([1, 2])
+
+with one_many_col1:
+    one_origin_label = st.selectbox(
+        "Common origin",
+        options=building_labels,
+        key="one_origin_building_select",
+    )
+
+with one_many_col2:
+    multiple_destination_labels = st.multiselect(
+        "Destination buildings",
+        options=building_labels,
+        key="multiple_destination_buildings_select",
+    )
+
+if st.button(
+    "Calculate separate routes from origin",
+    type="primary",
+    key="calculate_one_origin_routes_button",
+):
+    try:
+        origin_id = building_label_to_fid[
+            one_origin_label
+        ]
+
+        destination_ids = [
+            building_label_to_fid[label]
+            for label in multiple_destination_labels
+        ]
+
+        with st.spinner(
+            "Calculating separate shortest paths..."
+        ):
+            multi_results, multi_table = (
+                calculate_routes_from_origin_to_destinations(
+                    origin_id=origin_id,
+                    destination_ids=destination_ids,
+                )
+            )
+
+        st.session_state.multi_route_results = multi_results
+        st.session_state.multi_route_table = multi_table
+        st.session_state.multi_route_destination = None
+        st.session_state.independent_route_mode = (
+            "one_origin_multiple_destinations"
+        )
+
+        st.session_state.route_result = None
+        st.session_state.route_legs = None
+        st.session_state.total_distance = None
+        st.session_state.selected_building_ids = None
+
+        st.success(
+            f"Calculated {len(multi_results)} separate shortest paths "
+            f"from Building {origin_id}."
+        )
+
+    except Exception as error:
+        st.error(
+            f"Unable to calculate the separate routes: {error}"
+        )
 
 
 # ============================================================
@@ -1709,9 +2027,27 @@ with st.form(
         "Enter a route request",
         value=st.session_state.last_question,
         placeholder=(
-            "Example: Start at Building 10, visit Building 20, "
-            "then Building 35, and return to Building 10"
+            "Example: Find the shortest route from Building 10 "
+            "to Building 20"
         ),
+    )
+
+    st.markdown(
+        """
+        **Sample wording**
+
+        • **One point → one point:**  
+        `Find the shortest route from Building 10 to Building 20.`
+
+        • **Ordered multi-stop route:**  
+        `Start at Building 10, visit Buildings 20 and 35, then go to Building 50.`
+
+        • **Multiple Origins → One Destination:**  
+        `Show separate shortest paths from Buildings 1, 2, 3 and 4 to Building 444.`
+
+        • **One Origin → Multiple Destinations:**  
+        `Show separate shortest paths from Building 10 to Buildings 20, 30 and 40.`
+        """
     )
 
     submitted = st.form_submit_button(
@@ -1727,8 +2063,22 @@ if submitted:
         st.warning("Please enter a route request.")
 
     else:
-        parsed = parse_multi_origin_command(question)
-        interpreter_used = "Built-in multi-origin parser" if parsed else ""
+        parsed = parse_one_origin_multi_destination_command(
+            question
+        )
+
+        if parsed:
+            interpreter_used = (
+                "Built-in one-origin/multiple-destination parser"
+            )
+        else:
+            parsed = parse_multi_origin_command(
+                question
+            )
+            interpreter_used = (
+                "Built-in multiple-origin parser"
+                if parsed else ""
+            )
 
         # Use Gemini when the request is not an explicit multi-origin command.
         try:
@@ -1767,7 +2117,58 @@ if submitted:
             parsed.get("reply", "")
         ).strip()
 
-        if parsed.get("action") == "multi_origin_route":
+        if parsed.get("action") == "one_origin_multi_destination":
+            try:
+                origin_id = int(
+                    parsed.get("origin_id")
+                )
+
+                destination_ids = [
+                    int(fid)
+                    for fid in parsed.get(
+                        "destination_ids",
+                        [],
+                    )
+                ]
+
+                with st.spinner(
+                    "Calculating separate GIS shortest paths..."
+                ):
+                    multi_results, multi_table = (
+                        calculate_routes_from_origin_to_destinations(
+                            origin_id=origin_id,
+                            destination_ids=destination_ids,
+                        )
+                    )
+
+                st.session_state.multi_route_results = multi_results
+                st.session_state.multi_route_table = multi_table
+                st.session_state.multi_route_destination = None
+                st.session_state.independent_route_mode = (
+                    "one_origin_multiple_destinations"
+                )
+
+                st.session_state.route_result = None
+                st.session_state.route_legs = None
+                st.session_state.total_distance = None
+                st.session_state.selected_building_ids = None
+
+                if st.session_state.last_ai_reply:
+                    st.info(
+                        st.session_state.last_ai_reply
+                    )
+
+                st.success(
+                    f"Calculated {len(multi_results)} independent routes "
+                    f"from Building {origin_id}."
+                )
+
+            except Exception as error:
+                st.error(
+                    f"Unable to calculate routes: {error}"
+                )
+
+        elif parsed.get("action") == "multi_origin_route":
             try:
                 origin_ids = [int(fid) for fid in parsed.get("origin_ids", [])]
                 destination_id = int(parsed.get("destination_id"))
@@ -1783,6 +2184,9 @@ if submitted:
                 st.session_state.multi_route_results = multi_results
                 st.session_state.multi_route_table = multi_table
                 st.session_state.multi_route_destination = destination_id
+                st.session_state.independent_route_mode = (
+                    "multiple_origins_one_destination"
+                )
                 st.session_state.route_result = None
                 st.session_state.route_legs = None
                 st.session_state.total_distance = None
@@ -1835,6 +2239,7 @@ if submitted:
                     st.session_state.multi_route_results = None
                     st.session_state.multi_route_table = None
                     st.session_state.multi_route_destination = None
+                    st.session_state.independent_route_mode = None
 
                     if st.session_state.last_ai_reply:
                         st.info(
@@ -1892,6 +2297,7 @@ if (
         st.session_state.multi_route_results = None
         st.session_state.multi_route_table = None
         st.session_state.multi_route_destination = None
+        st.session_state.independent_route_mode = None
         st.rerun()
 
 
@@ -1942,15 +2348,42 @@ if (
     and st.session_state.multi_route_table is not None
 ):
     st.subheader("Separate route summary")
-    st.caption(
-        "Every row is an independent network shortest path to the "
-        "same destination. The routes are not combined and are not ranked."
+
+    if (
+        st.session_state.independent_route_mode
+        == "one_origin_multiple_destinations"
+    ):
+        st.caption(
+            "Every row is an independent shortest path from the same "
+            "origin to a different destination. The routes are not combined."
+        )
+    else:
+        st.caption(
+            "Every row is an independent shortest path from a different "
+            "origin to the same destination. The routes are not combined "
+            "and are not ranked."
+        )
+
+    standard_multi_table = (
+        st.session_state.multi_route_table[
+            STANDARD_CSV_COLUMNS
+        ].copy()
     )
 
     st.dataframe(
-        st.session_state.multi_route_table,
+        standard_multi_table,
         use_container_width=True,
         hide_index=True,
+    )
+
+    st.download_button(
+        label="Download route results as CSV",
+        data=route_table_to_csv(
+            standard_multi_table
+        ),
+        file_name="route_results.csv",
+        mime="text/csv",
+        key="download_independent_routes_csv",
     )
 
     for result in st.session_state.multi_route_results:
