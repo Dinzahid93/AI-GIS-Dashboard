@@ -1060,6 +1060,147 @@ with st.expander("🏢 Admin Building Name Editor", expanded=False):
                 + (current_name if current_name else "Unnamed")
             )
 
+            # ----------------------------------------------------
+            # Selected-building preview map
+            # ----------------------------------------------------
+            st.markdown("#### Selected building preview")
+            st.caption(
+                "Change the FID above and this map will zoom to the "
+                "selected building so you can identify it before naming it."
+            )
+
+            preview_selected_wgs = buildings_wgs[
+                buildings_wgs["FID"] == selected_editor_fid
+            ].copy()
+
+            preview_selected_m = buildings_m[
+                buildings_m["FID"] == selected_editor_fid
+            ].copy()
+
+            if not preview_selected_wgs.empty:
+                preview_point_m = (
+                    preview_selected_m.geometry
+                    .representative_point()
+                    .iloc[0]
+                )
+
+                preview_point_wgs = (
+                    gpd.GeoSeries(
+                        [preview_point_m],
+                        crs=PROJECTED_CRS,
+                    )
+                    .to_crs(WEB_CRS)
+                    .iloc[0]
+                )
+
+                preview_map = folium.Map(
+                    location=[
+                        preview_point_wgs.y,
+                        preview_point_wgs.x,
+                    ],
+                    zoom_start=20,
+                    tiles=None,
+                    max_zoom=23,
+                    control_scale=True,
+                )
+
+                # OpenStreetMap base
+                folium.TileLayer(
+                    tiles="OpenStreetMap",
+                    name="OpenStreetMap",
+                    overlay=False,
+                    control=True,
+                    show=True,
+                    max_zoom=23,
+                ).add_to(preview_map)
+
+                # Transparent UAV orthomosaic overlay
+                preview_ortho = TransparentWhiteTileLayer(
+                    tile_url=ORTHO_TILE_URL,
+                    white_threshold=245,
+                    opacity=1.0,
+                    max_native_zoom=20,
+                    max_zoom=23,
+                )
+                preview_ortho.add_to(preview_map)
+
+                # Nearby roads for orientation
+                folium.GeoJson(
+                    roads_wgs,
+                    name="Road Network",
+                    style_function=lambda feature: {
+                        "color": ROAD_COLOUR,
+                        "weight": 2.5,
+                        "opacity": 0.75,
+                    },
+                ).add_to(preview_map)
+
+                # All buildings remain orange
+                folium.GeoJson(
+                    buildings_wgs,
+                    name="Building Footprints",
+                    style_function=lambda feature: {
+                        "color": BUILDING_COLOUR,
+                        "weight": 1.0,
+                        "fillColor": BUILDING_COLOUR,
+                        "fillOpacity": 0.18,
+                    },
+                    tooltip=folium.GeoJsonTooltip(
+                        fields=["FID", "NAME"],
+                        aliases=["Building ID:", "Building Name:"],
+                        sticky=True,
+                    ),
+                ).add_to(preview_map)
+
+                # Selected building is highlighted in green
+                folium.GeoJson(
+                    preview_selected_wgs,
+                    name=f"Selected Building {selected_editor_fid}",
+                    style_function=lambda feature: {
+                        "color": START_COLOUR,
+                        "weight": 4,
+                        "fillColor": START_COLOUR,
+                        "fillOpacity": 0.72,
+                    },
+                    tooltip=folium.Tooltip(
+                        f"Selected Building FID: {selected_editor_fid}<br>"
+                        f"Current name: "
+                        f"{current_name if current_name else 'Unnamed'}",
+                        sticky=True,
+                    ),
+                ).add_to(preview_map)
+
+                folium.Marker(
+                    location=[
+                        preview_point_wgs.y,
+                        preview_point_wgs.x,
+                    ],
+                    tooltip=f"Building FID {selected_editor_fid}",
+                    popup=(
+                        f"<b>Building FID:</b> {selected_editor_fid}<br>"
+                        f"<b>Current name:</b> "
+                        f"{current_name if current_name else 'Unnamed'}"
+                    ),
+                ).add_to(preview_map)
+
+                folium.LayerControl(
+                    collapsed=True,
+                    position="topright",
+                ).add_to(preview_map)
+
+                st_folium(
+                    preview_map,
+                    width=None,
+                    height=430,
+                    returned_objects=[],
+                    use_container_width=True,
+                    key=f"building_preview_map_{selected_editor_fid}",
+                )
+            else:
+                st.warning(
+                    f"Building FID {selected_editor_fid} could not be displayed."
+                )
+
             new_name = st.text_input(
                 "New building name",
                 value=current_name,
