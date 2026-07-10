@@ -1502,22 +1502,14 @@ if submitted:
 
 
 # ============================================================
-# 15. CLEAR ROUTE
+# 15. ROUTE MAP — ALWAYS VISIBLE
 # ============================================================
 
-if st.session_state.route_result is not None:
-    if st.button("Clear route"):
-        st.session_state.route_result = None
-        st.session_state.route_legs = None
-        st.session_state.total_distance = None
-        st.session_state.selected_building_ids = None
-        st.session_state.last_question = ""
-        st.rerun()
-
-
-# ============================================================
-# 16. DISPLAY MAP
-# ============================================================
+st.markdown("### Route map")
+st.caption(
+    "The orthomosaic, OpenStreetMap, road network, building footprints, "
+    "route arrows and stop markers are shown here."
+)
 
 campus_map = create_map(
     route_result=st.session_state.route_result,
@@ -1526,14 +1518,35 @@ campus_map = create_map(
     building_ids=st.session_state.selected_building_ids,
 )
 
+# A changing key forces Streamlit-Folium to refresh when the route changes.
+route_key_part = "none"
+if st.session_state.selected_building_ids:
+    route_key_part = "_".join(
+        str(value) for value in st.session_state.selected_building_ids
+    )
+
 st_folium(
     campus_map,
     width=None,
     height=720,
     returned_objects=[],
     use_container_width=True,
-    key="main_campus_map",
+    key=f"main_campus_map_{route_key_part}",
 )
+
+
+# ============================================================
+# 16. CLEAR ROUTE
+# ============================================================
+
+if st.session_state.route_result is not None:
+    if st.button("Clear route", key="clear_route_button"):
+        st.session_state.route_result = None
+        st.session_state.route_legs = None
+        st.session_state.total_distance = None
+        st.session_state.selected_building_ids = None
+        st.session_state.last_question = ""
+        st.rerun()
 
 
 # ============================================================
