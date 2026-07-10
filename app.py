@@ -17,7 +17,7 @@ from streamlit_folium import st_folium
 
 
 # ============================================================
-# 1. STREAMLIT SETTINGS
+# 1. STREAMLIT PAGE SETTINGS
 # ============================================================
 
 st.set_page_config(
@@ -29,7 +29,7 @@ st.set_page_config(
 
 
 # ============================================================
-# 2. DASHBOARD CSS
+# 2. PAGE STYLE
 # ============================================================
 
 st.markdown(
@@ -46,10 +46,18 @@ st.markdown(
         border: 1px solid #e5e7eb;
         border-radius: 12px;
         padding: 12px 16px;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.05);
     }
 
     iframe {
         border-radius: 12px;
+    }
+
+    .route-summary {
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 15px;
     }
     </style>
     """,
@@ -58,7 +66,7 @@ st.markdown(
 
 
 # ============================================================
-# 3. DATA PATHS AND SETTINGS
+# 3. PROJECT FILES AND SETTINGS
 # ============================================================
 
 APP_FOLDER = Path(__file__).resolve().parent
@@ -80,29 +88,62 @@ ROAD_COLOUR = "#8B4513"
 ROUTE_COLOUR = "#E74C3C"
 START_COLOUR = "#2ECC71"
 DESTINATION_COLOUR = "#3498DB"
-STOP_COLOUR = "#8E44AD"
+INTERMEDIATE_COLOUR = "#8E44AD"
 
 
 # ============================================================
-# 4. LOAD DATA
+# 4. SESSION STATE
 # ============================================================
 
-@st.cache_data(show_spinner="Loading GIS data...")
+if "route_result" not in st.session_state:
+    st.session_state.route_result = None
+
+if "route_legs" not in st.session_state:
+    st.session_state.route_legs = None
+
+if "total_distance" not in st.session_state:
+    st.session_state.total_distance = None
+
+if "selected_building_ids" not in st.session_state:
+    st.session_state.selected_building_ids = None
+
+if "last_question" not in st.session_state:
+    st.session_state.last_question = ""
+
+
+# ============================================================
+# 5. LOAD GIS DATA
+# ============================================================
+
+@st.cache_data(show_spinner="Loading GIS layers...")
 def load_gis_data():
     if not BUILDING_FILE.exists():
-        raise FileNotFoundError(BUILDING_FILE.name)
+        raise FileNotFoundError(
+            f"Missing file: {BUILDING_FILE.name}"
+        )
 
     if not ROAD_FILE.exists():
-        raise FileNotFoundError(ROAD_FILE.name)
+        raise FileNotFoundError(
+            f"Missing file: {ROAD_FILE.name}"
+        )
 
     buildings = gpd.read_file(BUILDING_FILE)
     roads = gpd.read_file(ROAD_FILE)
 
-    if buildings.crs is None or roads.crs is None:
-        raise ValueError("One or more GIS layers have no CRS.")
+    if buildings.crs is None:
+        raise ValueError(
+            "The building layer has no coordinate system."
+        )
+
+    if roads.crs is None:
+        raise ValueError(
+            "The road layer has no coordinate system."
+        )
 
     if "FID" not in buildings.columns:
-        raise ValueError("Building layer requires an FID field.")
+        raise ValueError(
+            "The building layer requires a field named FID."
+        )
 
     buildings = buildings[
         buildings.geometry.notna()
@@ -133,13 +174,18 @@ roads_m = roads.to_crs(PROJECTED_CRS)
 
 
 # ============================================================
-# 5. BUILD ROAD NETWORK
+# 6. BUILD ROAD NETWORK
 # ============================================================
 
 @st.cache_resource(show_spinner="Preparing road network...")
-def build_road_graph(roads_projected):
+def build_road_graph(_roads_projected):
+    """
+    The leading underscore tells Streamlit not to hash the
+    GeoDataFrame argument. This fixes the caching error.
+    """
+
     exploded = (
-        roads_projected
+        _roads_projected
         .explode(index_parts=False)
         .reset_index(drop=True)
     )
@@ -180,43 +226,74 @@ def build_road_graph(roads_projected):
             )
 
     if graph.number_of_nodes() == 0:
-        raise ValueError("Road graph contains no nodes.")
+        raise ValueError(
+            "No road-network nodes could be created."
+        )
+
+    connected_components = list(
+        nx.connected_components(graph)
+    )
 
     largest_component = max(
-        nx.connected_components(graph),
+        connected_components,
         key=len,
     )
 
-    main_graph = graph.subgraph(largest_component).copy()
+    main_graph = graph.subgraph(
+        largest_component
+    ).copy()
 
     node_list = list(main_graph.nodes)
-    node_array = np.array(node_list, dtype=float)
+    node_array = np.asarray(
+        node_list,
+        dtype=float,
+    )
+
     node_tree = cKDTree(node_array)
 
-    return main_graph, node_array, node_tree
+    return (
+        main_graph,
+        node_array,
+        node_tree,
+        len(connected_components),
+    )
 
 
 try:
-    G_MAIN, MAIN_NODE_ARRAY, MAIN_TREE = build_road_graph(roads_m)
+    (
+        G_MAIN,
+        MAIN_NODE_ARRAY,
+        MAIN_TREE,
+        ROAD_GROUP_COUNT,
+    ) = build_road_graph(roads_m)
 
 except Exception as error:
-    st.error(f"Could not prepare road network: {error}")
+    st.error(
+        f"Could not prepare road network: {error}"
+    )
     st.stop()
 
 
 # ============================================================
-# 6. ROUTING FUNCTIONS
+# 7. ROUTING ENGINE
 # ============================================================
 
 def nearest_main_node(point):
-    distance, index = MAIN_TREE.query([point.x, point.y])
+    distance, index = MAIN_TREE.query(
+        [point.x, point.y]
+    )
 
-    node = tuple(MAIN_NODE_ARRAY[index])
+    node = tuple(
+        MAIN_NODE_ARRAY[index]
+    )
 
     return node, float(distance)
 
 
-def shortest_route_between_buildings(origin_fid, destination_fid):
+def shortest_route_between_buildings(
+    origin_fid,
+    destination_fid,
+):
     origin = buildings_m[
         buildings_m["FID"] == origin_fid
     ]
@@ -235,12 +312,24 @@ def shortest_route_between_buildings(origin_fid, destination_fid):
             f"Building {destination_fid} was not found."
         )
 
-    origin_point = origin.geometry.centroid.iloc[0]
-    destination_point = destination.geometry.centroid.iloc[0]
+    origin_point = (
+        origin.geometry
+        .representative_point()
+        .iloc[0]
+    )
 
-    origin_node, origin_snap = nearest_main_node(origin_point)
-    destination_node, destination_snap = nearest_main_node(
-        destination_point
+    destination_point = (
+        destination.geometry
+        .representative_point()
+        .iloc[0]
+    )
+
+    origin_node, origin_snap = nearest_main_node(
+        origin_point
+    )
+
+    destination_node, destination_snap = (
+        nearest_main_node(destination_point)
     )
 
     path_nodes = nx.shortest_path(
@@ -259,15 +348,25 @@ def shortest_route_between_buildings(origin_fid, destination_fid):
 
         edge = G_MAIN[node_a][node_b]
 
-        route_segments.append(edge["geometry"])
-        total_distance += float(edge["weight"])
+        route_segments.append(
+            edge["geometry"]
+        )
+
+        total_distance += float(
+            edge["weight"]
+        )
 
     route = gpd.GeoDataFrame(
         geometry=route_segments,
         crs=PROJECTED_CRS,
     )
 
-    return route, total_distance, origin_snap, destination_snap
+    return (
+        route,
+        total_distance,
+        origin_snap,
+        destination_snap,
+    )
 
 
 def calculate_multi_stop_route(building_ids):
@@ -277,18 +376,20 @@ def calculate_multi_stop_route(building_ids):
         )
 
     valid_ids = set(
-        buildings_m["FID"].astype(int).tolist()
+        buildings_m["FID"]
+        .astype(int)
+        .tolist()
     )
 
-    missing = [
+    missing_ids = [
         building_id
         for building_id in building_ids
         if building_id not in valid_ids
     ]
 
-    if missing:
+    if missing_ids:
         raise ValueError(
-            f"Building IDs not found: {missing}"
+            f"Building IDs not found: {missing_ids}"
         )
 
     route_parts = []
@@ -299,39 +400,57 @@ def calculate_multi_stop_route(building_ids):
         origin = building_ids[index]
         destination = building_ids[index + 1]
 
-        route, leg_distance, origin_snap, destination_snap = (
-            shortest_route_between_buildings(
-                origin,
-                destination,
-            )
+        (
+            route,
+            leg_distance,
+            origin_snap,
+            destination_snap,
+        ) = shortest_route_between_buildings(
+            origin,
+            destination,
         )
 
         route = route.copy()
-        route["leg"] = f"{origin} → {destination}"
-        route["leg_distance_m"] = leg_distance
+        route["leg"] = (
+            f"{origin} → {destination}"
+        )
+
+        route["leg_distance_m"] = (
+            leg_distance
+        )
 
         route_parts.append(route)
 
         route_legs.append(
             {
-                "origin": origin,
-                "destination": destination,
-                "distance_m": leg_distance,
+                "From building": origin,
+                "To building": destination,
+                "Distance (m)": round(
+                    leg_distance,
+                    1,
+                ),
             }
         )
 
         total_distance += leg_distance
 
     combined_route = gpd.GeoDataFrame(
-        pd.concat(route_parts, ignore_index=True),
+        pd.concat(
+            route_parts,
+            ignore_index=True,
+        ),
         crs=PROJECTED_CRS,
     )
 
-    return combined_route, route_legs, total_distance
+    return (
+        combined_route,
+        route_legs,
+        total_distance,
+    )
 
 
 # ============================================================
-# 7. SIMPLE NATURAL-LANGUAGE PARSER
+# 8. BASIC NATURAL-LANGUAGE PARSER
 # ============================================================
 
 def parse_command(question):
@@ -339,7 +458,10 @@ def parse_command(question):
 
     building_ids = [
         int(number)
-        for number in re.findall(r"\d+", question_lower)
+        for number in re.findall(
+            r"\d+",
+            question_lower,
+        )
     ]
 
     route_keywords = [
@@ -351,6 +473,7 @@ def parse_command(question):
         "travel",
         "from",
         "visit",
+        "walk",
     ]
 
     if (
@@ -372,7 +495,7 @@ def parse_command(question):
 
 
 # ============================================================
-# 8. TRANSPARENT ORTHOMOSAIC
+# 9. TRANSPARENT ORTHOMOSAIC TILE LAYER
 # ============================================================
 
 class TransparentWhiteTileLayer(MacroElement):
@@ -397,11 +520,14 @@ class TransparentWhiteTileLayer(MacroElement):
             """
             {% macro script(this, kwargs) %}
 
-            var {{ this.get_name() }} = L.GridLayer.extend({
+            var {{ this.get_name() }}Class =
+                L.GridLayer.extend({
 
                 createTile: function(coords, done) {
 
-                    var tile = document.createElement("canvas");
+                    var tile =
+                        document.createElement("canvas");
+
                     var size = this.getTileSize();
 
                     tile.width = size.x;
@@ -415,7 +541,8 @@ class TransparentWhiteTileLayer(MacroElement):
                     var image = new Image();
                     image.crossOrigin = "anonymous";
 
-                    var tileUrl = "{{ this.tile_url }}"
+                    var tileUrl =
+                        "{{ this.tile_url }}"
                         .replace("{z}", coords.z)
                         .replace("{x}", coords.x)
                         .replace("{y}", coords.y);
@@ -431,14 +558,17 @@ class TransparentWhiteTileLayer(MacroElement):
                                 size.y
                             );
 
-                            var imageData = context.getImageData(
-                                0,
-                                0,
-                                size.x,
-                                size.y
-                            );
+                            var imageData =
+                                context.getImageData(
+                                    0,
+                                    0,
+                                    size.x,
+                                    size.y
+                                );
 
-                            var pixels = imageData.data;
+                            var pixels =
+                                imageData.data;
+
                             var threshold =
                                 {{ this.white_threshold }};
 
@@ -461,7 +591,10 @@ class TransparentWhiteTileLayer(MacroElement):
                                     Math.abs(red - blue) < 8 &&
                                     Math.abs(green - blue) < 8;
 
-                                if (nearWhite && similarValues) {
+                                if (
+                                    nearWhite &&
+                                    similarValues
+                                ) {
                                     pixels[i + 3] = 0;
                                 }
                             }
@@ -498,7 +631,7 @@ class TransparentWhiteTileLayer(MacroElement):
             });
 
             var {{ this.get_name() }}_layer =
-                new {{ this.get_name() }}({
+                new {{ this.get_name() }}Class({
 
                     tileSize: 256,
                     opacity: {{ this.opacity }},
@@ -520,7 +653,7 @@ class TransparentWhiteTileLayer(MacroElement):
 
 
 # ============================================================
-# 9. CREATE MAP
+# 10. CREATE MAP
 # ============================================================
 
 def create_map(
@@ -529,15 +662,26 @@ def create_map(
     total_distance=None,
     building_ids=None,
 ):
-    minimum_x, minimum_y, maximum_x, maximum_y = (
-        buildings_wgs.total_bounds
-    )
+    (
+        minimum_x,
+        minimum_y,
+        maximum_x,
+        maximum_y,
+    ) = buildings_wgs.total_bounds
 
-    centre_latitude = (minimum_y + maximum_y) / 2
-    centre_longitude = (minimum_x + maximum_x) / 2
+    centre_latitude = (
+        minimum_y + maximum_y
+    ) / 2
+
+    centre_longitude = (
+        minimum_x + maximum_x
+    ) / 2
 
     campus_map = folium.Map(
-        location=[centre_latitude, centre_longitude],
+        location=[
+            centre_latitude,
+            centre_longitude,
+        ],
         zoom_start=16,
         tiles=None,
         max_zoom=23,
@@ -545,18 +689,18 @@ def create_map(
         prefer_canvas=True,
     )
 
-    openstreetmap = folium.TileLayer(
+    # OpenStreetMap base
+    folium.TileLayer(
         tiles="OpenStreetMap",
         name="OpenStreetMap",
         overlay=False,
         control=True,
         show=True,
         max_zoom=23,
-    )
+    ).add_to(campus_map)
 
-    openstreetmap.add_to(campus_map)
-
-    orthomosaic = TransparentWhiteTileLayer(
+    # Transparent orthomosaic overlay
+    orthomosaic_layer = TransparentWhiteTileLayer(
         tile_url=ORTHO_TILE_URL,
         white_threshold=245,
         opacity=1.0,
@@ -564,8 +708,9 @@ def create_map(
         max_zoom=23,
     )
 
-    orthomosaic.add_to(campus_map)
+    orthomosaic_layer.add_to(campus_map)
 
+    # Road network
     folium.GeoJson(
         roads_wgs,
         name="Road Network",
@@ -576,6 +721,7 @@ def create_map(
         },
     ).add_to(campus_map)
 
+    # Building footprints
     folium.GeoJson(
         buildings_wgs,
         name="Building Footprints",
@@ -585,6 +731,11 @@ def create_map(
             "fillColor": BUILDING_COLOUR,
             "fillOpacity": 0.22,
         },
+        highlight_function=lambda feature: {
+            "color": "#FFD700",
+            "weight": 3,
+            "fillOpacity": 0.38,
+        },
         tooltip=folium.GeoJsonTooltip(
             fields=["FID"],
             aliases=["Building ID:"],
@@ -592,16 +743,37 @@ def create_map(
         ),
     ).add_to(campus_map)
 
-    if route_result is not None:
-        route_wgs = route_result.to_crs(WEB_CRS)
+    # Route result
+    if (
+        route_result is not None
+        and building_ids is not None
+        and total_distance is not None
+    ):
+        route_wgs = route_result.to_crs(
+            WEB_CRS
+        )
 
-        walking_time = total_distance / 80.0
+        walking_time = (
+            total_distance / 80.0
+        )
+
+        leg_text = ""
+
+        if route_legs:
+            for leg in route_legs:
+                leg_text += (
+                    f"{leg['From building']} → "
+                    f"{leg['To building']}: "
+                    f"{leg['Distance (m)']} m<br>"
+                )
 
         route_summary = (
             f"<b>Calculated Route</b><br>"
-            f"Stops: {building_ids}<br>"
-            f"Total distance: {total_distance:.2f} m<br>"
-            f"Estimated walking time: "
+            f"Stops: {building_ids}<br><br>"
+            f"{leg_text}"
+            f"<b>Total distance:</b> "
+            f"{total_distance:.1f} m<br>"
+            f"<b>Walking time:</b> "
             f"{walking_time:.1f} min"
         )
 
@@ -619,50 +791,84 @@ def create_map(
             ),
         ).add_to(campus_map)
 
+        # Selected stop buildings
         for stop_number, building_id in enumerate(
             building_ids,
             start=1,
         ):
-            selected = buildings_wgs[
-                buildings_wgs["FID"] == building_id
+            selected_wgs = buildings_wgs[
+                buildings_wgs["FID"]
+                == building_id
             ]
 
-            if selected.empty:
+            selected_m = buildings_m[
+                buildings_m["FID"]
+                == building_id
+            ]
+
+            if (
+                selected_wgs.empty
+                or selected_m.empty
+            ):
                 continue
 
-            centroid = selected.geometry.centroid.iloc[0]
+            marker_point_m = (
+                selected_m.geometry
+                .representative_point()
+                .iloc[0]
+            )
+
+            marker_point_wgs = (
+                gpd.GeoSeries(
+                    [marker_point_m],
+                    crs=PROJECTED_CRS,
+                )
+                .to_crs(WEB_CRS)
+                .iloc[0]
+            )
 
             if stop_number == 1:
                 colour = START_COLOUR
-                label = f"Start: Building {building_id}"
+                label = (
+                    f"Start: Building "
+                    f"{building_id}"
+                )
 
-            elif stop_number == len(building_ids):
+            elif stop_number == len(
+                building_ids
+            ):
                 colour = DESTINATION_COLOUR
                 label = (
-                    f"Destination: Building {building_id}"
+                    f"Destination: Building "
+                    f"{building_id}"
                 )
 
             else:
-                colour = STOP_COLOUR
+                colour = INTERMEDIATE_COLOUR
                 label = (
                     f"Stop {stop_number}: "
                     f"Building {building_id}"
                 )
 
             folium.GeoJson(
-                selected,
+                selected_wgs,
                 name=label,
-                style_function=lambda feature, c=colour: {
-                    "color": c,
-                    "weight": 3,
-                    "fillColor": c,
-                    "fillOpacity": 0.75,
-                },
+                style_function=(
+                    lambda feature, c=colour: {
+                        "color": c,
+                        "weight": 3,
+                        "fillColor": c,
+                        "fillOpacity": 0.75,
+                    }
+                ),
                 tooltip=folium.Tooltip(label),
             ).add_to(campus_map)
 
             folium.Marker(
-                location=[centroid.y, centroid.x],
+                location=[
+                    marker_point_wgs.y,
+                    marker_point_wgs.x,
+                ],
                 tooltip=label,
                 popup=label,
                 icon=folium.DivIcon(
@@ -677,7 +883,9 @@ def create_map(
                         line-height:28px;
                         font-weight:bold;
                         border:2px solid white;
-                        box-shadow:0 1px 5px rgba(0,0,0,0.6);
+                        box-shadow:
+                            0 1px 5px
+                            rgba(0,0,0,0.6);
                     ">
                         {stop_number}
                     </div>
@@ -689,10 +897,16 @@ def create_map(
 
         campus_map.fit_bounds(
             [
-                [route_bounds[1], route_bounds[0]],
-                [route_bounds[3], route_bounds[2]],
+                [
+                    route_bounds[1],
+                    route_bounds[0],
+                ],
+                [
+                    route_bounds[3],
+                    route_bounds[2],
+                ],
             ],
-            padding=(40, 40),
+            padding=(45, 45),
         )
 
     else:
@@ -708,18 +922,42 @@ def create_map(
         position="topright",
         title="Full screen",
         title_cancel="Exit full screen",
+        force_separate_button=True,
     ).add_to(campus_map)
 
-    folium.LayerControl(
+    layer_control = folium.LayerControl(
         collapsed=False,
         position="topleft",
-    ).add_to(campus_map)
+    )
+
+    layer_control.add_to(campus_map)
+
+    # Register custom orthomosaic in layer control
+    campus_map.get_root().script.add_child(
+        folium.Element(
+            f"""
+            setTimeout(function() {{
+                try {{
+                    {layer_control.get_name()}.addOverlay(
+                        {orthomosaic_layer.get_name()}_layer,
+                        "UiTM Shah Alam Orthomosaic"
+                    );
+                }} catch (error) {{
+                    console.log(
+                        "Orthomosaic control registration:",
+                        error
+                    );
+                }}
+            }}, 500);
+            """
+        )
+    )
 
     return campus_map
 
 
 # ============================================================
-# 10. STREAMLIT INTERFACE
+# 11. STREAMLIT HEADER
 # ============================================================
 
 st.title("🗺️ AI GIS Dashboard")
@@ -745,126 +983,173 @@ with metric2:
 
 with metric3:
     st.metric(
-        "Current capability",
-        "Route planner",
+        "Road-network groups",
+        ROAD_GROUP_COUNT,
     )
 
 
 # ============================================================
-# 11. COMMAND BOX
+# 12. COMMAND FORM
 # ============================================================
 
 st.subheader("Ask the GIS")
 
-question = st.text_input(
-    "Enter a command",
-    placeholder=(
-        "Example: route from building 10 "
-        "to building 20 to building 35"
-    ),
-)
+with st.form(
+    key="gis_command_form",
+    clear_on_submit=False,
+):
+    question = st.text_input(
+        "Enter a route command",
+        value=st.session_state.last_question,
+        placeholder=(
+            "Example: route from building 10 "
+            "to building 20 to building 35"
+        ),
+    )
 
-run_button = st.button(
-    "Run GIS command",
-    type="primary",
-)
-
-route_result = None
-route_legs = None
-total_distance = None
-selected_building_ids = None
+    submitted = st.form_submit_button(
+        "Run GIS command",
+        type="primary",
+    )
 
 
-if run_button:
+if submitted:
+    st.session_state.last_question = question
+
     if not question.strip():
-        st.warning("Please enter a GIS command.")
+        st.warning(
+            "Please enter a route command."
+        )
 
     else:
         parsed = parse_command(question)
 
         if parsed["action"] == "route":
-            selected_building_ids = parsed[
+            building_ids = parsed[
                 "building_ids"
             ]
 
             try:
                 with st.spinner(
-                    "Calculating the shortest route..."
+                    "Calculating shortest route..."
                 ):
                     (
                         route_result,
                         route_legs,
                         total_distance,
                     ) = calculate_multi_stop_route(
-                        selected_building_ids
+                        building_ids
                     )
 
-                walking_time = total_distance / 80.0
+                st.session_state.route_result = (
+                    route_result
+                )
+
+                st.session_state.route_legs = (
+                    route_legs
+                )
+
+                st.session_state.total_distance = (
+                    total_distance
+                )
+
+                st.session_state.selected_building_ids = (
+                    building_ids
+                )
 
                 st.success(
                     "Route calculated successfully."
                 )
 
-                result1, result2, result3 = st.columns(3)
-
-                with result1:
-                    st.metric(
-                        "Stops",
-                        len(selected_building_ids),
-                    )
-
-                with result2:
-                    st.metric(
-                        "Total distance",
-                        f"{total_distance:.1f} m",
-                    )
-
-                with result3:
-                    st.metric(
-                        "Walking time",
-                        f"{walking_time:.1f} min",
-                    )
-
-                route_table = pd.DataFrame(route_legs)
-
-                route_table.columns = [
-                    "From building",
-                    "To building",
-                    "Distance (m)",
-                ]
-
-                route_table["Distance (m)"] = (
-                    route_table["Distance (m)"]
-                    .round(1)
-                )
-
-                st.dataframe(
-                    route_table,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
             except Exception as error:
                 st.error(
-                    f"Unable to calculate route: {error}"
+                    f"Unable to calculate route: "
+                    f"{error}"
                 )
 
         else:
             st.warning(
                 "Command not recognised. Try: "
-                "'route from building 10 to building 20'."
+                "'route from building 10 "
+                "to building 20'."
             )
 
 
 # ============================================================
-# 12. DISPLAY MAP
+# 13. CLEAR ROUTE
+# ============================================================
+
+if st.session_state.route_result is not None:
+    if st.button("Clear route"):
+        st.session_state.route_result = None
+        st.session_state.route_legs = None
+        st.session_state.total_distance = None
+        st.session_state.selected_building_ids = None
+        st.session_state.last_question = ""
+        st.rerun()
+
+
+# ============================================================
+# 14. ROUTE RESULTS
+# ============================================================
+
+if (
+    st.session_state.route_result is not None
+    and st.session_state.total_distance
+    is not None
+):
+    total_distance = (
+        st.session_state.total_distance
+    )
+
+    walking_time = total_distance / 80.0
+
+    result1, result2, result3 = st.columns(3)
+
+    with result1:
+        st.metric(
+            "Stops",
+            len(
+                st.session_state
+                .selected_building_ids
+            ),
+        )
+
+    with result2:
+        st.metric(
+            "Total distance",
+            f"{total_distance:.1f} m",
+        )
+
+    with result3:
+        st.metric(
+            "Estimated walking time",
+            f"{walking_time:.1f} min",
+        )
+
+    route_table = pd.DataFrame(
+        st.session_state.route_legs
+    )
+
+    st.dataframe(
+        route_table,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+# ============================================================
+# 15. DISPLAY MAP
 # ============================================================
 
 campus_map = create_map(
-    route_result=route_result,
-    route_legs=route_legs,
-    total_distance=total_distance,
-    building_ids=selected_building_ids,
+    route_result=st.session_state.route_result,
+    route_legs=st.session_state.route_legs,
+    total_distance=st.session_state.total_distance,
+    building_ids=(
+        st.session_state
+        .selected_building_ids
+    ),
 )
 
 st_folium(
