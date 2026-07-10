@@ -1,4 +1,5 @@
 from pathlib import Path
+import math
 import re
 
 import folium
@@ -10,7 +11,7 @@ import streamlit as st
 from ai_engine import interpret_gis_command
 
 from branca.element import MacroElement
-from folium.plugins import Fullscreen
+from folium.plugins import Fullscreen, PolyLineTextPath
 from jinja2 import Template
 from scipy.spatial import cKDTree
 from shapely.geometry import LineString
@@ -97,6 +98,27 @@ START_COLOUR = "#2ECC71"
 DESTINATION_COLOUR = "#3498DB"
 INTERMEDIATE_COLOUR = "#8E44AD"
 
+# Unique stop-marker colours for up to 10 stops.
+STOP_COLOURS = [
+    "#1976D2",  # 1 blue
+    "#EF6C00",  # 2 orange
+    "#2E7D32",  # 3 green
+    "#7B1FA2",  # 4 purple
+    "#D32F2F",  # 5 red
+    "#795548",  # 6 brown
+    "#D81B60",  # 7 pink
+    "#616161",  # 8 grey
+    "#C0A000",  # 9 gold
+    "#0097A7",  # 10 cyan
+]
+
+TRAVEL_SPEEDS_KMH = {
+    "Walking": 4.8,
+    "E-bike": 18.0,
+    "Motorcycle": 30.0,
+    "Car driving": 45.0,
+}
+
 
 # ============================================================
 # 4. SESSION STATE
@@ -116,12 +138,6 @@ if "selected_building_ids" not in st.session_state:
 
 if "last_question" not in st.session_state:
     st.session_state.last_question = ""
-
-if "last_ai_reply" not in st.session_state:
-    st.session_state.last_ai_reply = ""
-
-if "last_interpreter" not in st.session_state:
-    st.session_state.last_interpreter = ""
 
 
 # ============================================================
@@ -522,6 +538,68 @@ def get_building_name(building_id):
     return name if name else f"Building {building_id}"
 
 
+def format_travel_time(distance_m, speed_kmh):
+    """Return a readable estimated travel time."""
+    total_seconds = max(0, round((float(distance_m) / 1000.0) / speed_kmh * 3600.0))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if hours:
+        return f"{hours} hr {minutes} min"
+    if minutes:
+        return f"{minutes} min {seconds} sec"
+    return f"{seconds} sec"
+
+
+def travel_time_estimates(distance_m):
+    return {
+        mode: format_travel_time(distance_m, speed)
+        for mode, speed in TRAVEL_SPEEDS_KMH.items()
+    }
+
+
+def offset_marker_positions(building_ids, projected_buildings, offset_m=4.0):
+    """
+    Return one WGS84 marker point for every stop. Repeated visits to the
+    same building are offset around the representative point so that, for
+    example, Stop 1 and Stop 6 remain visible instead of overlapping.
+    """
+    counts = {}
+    for fid in building_ids:
+        counts[int(fid)] = counts.get(int(fid), 0) + 1
+
+    used = {}
+    points = []
+
+    for fid in building_ids:
+        fid = int(fid)
+        selected = projected_buildings[projected_buildings["FID"] == fid]
+        if selected.empty:
+            points.append(None)
+            continue
+
+        base = selected.geometry.representative_point().iloc[0]
+        duplicate_total = counts[fid]
+        duplicate_index = used.get(fid, 0)
+        used[fid] = duplicate_index + 1
+
+        if duplicate_total > 1:
+            angle = (2 * math.pi * duplicate_index / duplicate_total) - (math.pi / 2)
+            x = base.x + offset_m * math.cos(angle)
+            y = base.y + offset_m * math.sin(angle)
+        else:
+            x, y = base.x, base.y
+
+        wgs_point = (
+            gpd.GeoSeries([LineString([(x, y), (x, y)]).centroid], crs=PROJECTED_CRS)
+            .to_crs(WEB_CRS)
+            .iloc[0]
+        )
+        points.append(wgs_point)
+
+    return points
+
+
 # ============================================================
 # 9. TRANSPARENT ORTHOMOSAIC TILE LAYER
 # ============================================================
@@ -795,88 +873,97 @@ def create_map(
                     f"{leg['Distance (m)']} m<br>"
                 )
 
+        times = travel_time_estimates(total_distance)
+
         route_summary = (
             f"<b>Calculated Route</b><br>"
             f"Stops: {building_ids}<br><br>"
             f"{leg_text}"
-            f"<b>Total distance:</b> "
-            f"{total_distance:.1f} m<br>"
-            f"<b>Walking time:</b> "
-            f"{walking_time:.1f} min"
+            f"<b>Total distance:</b> {total_distance:.1f} m<br>"
+            f"<b>Walking:</b> {times['Walking']}<br>"
+            f"<b>E-bike:</b> {times['E-bike']}<br>"
+            f"<b>Motorcycle:</b> {times['Motorcycle']}<br>"
+            f"<b>Car driving:</b> {times['Car driving']}"
         )
 
-        folium.GeoJson(
-            route_wgs,
-            name="Calculated Route",
-            style_function=lambda feature: {
-                "color": ROUTE_COLOUR,
-                "weight": 7,
-                "opacity": 1.0,
-            },
-            tooltip=folium.Tooltip(
-                route_summary,
-                sticky=True,
-            ),
-        ).add_to(campus_map)
+        # Draw route with repeated directional arrows.
+        route_group = folium.FeatureGroup(
+            name="Calculated Route (with arrows)",
+            show=True,
+        )
+        route_group.add_to(campus_map)
 
-        # Selected stop buildings
-        for stop_number, building_id in enumerate(
+        for geometry in route_wgs.geometry:
+            if geometry is None or geometry.is_empty:
+                continue
+
+            line_geometries = (
+                list(geometry.geoms)
+                if geometry.geom_type == "MultiLineString"
+                else [geometry]
+            )
+
+            for line_geometry in line_geometries:
+                coordinates = [
+                    [latitude, longitude]
+                    for longitude, latitude in line_geometry.coords
+                ]
+
+                # White casing improves visibility over the orthomosaic.
+                folium.PolyLine(
+                    coordinates,
+                    color="white",
+                    weight=10,
+                    opacity=0.90,
+                ).add_to(route_group)
+
+                route_line = folium.PolyLine(
+                    coordinates,
+                    color=ROUTE_COLOUR,
+                    weight=6,
+                    opacity=1.0,
+                    tooltip=folium.Tooltip(route_summary, sticky=True),
+                )
+                route_line.add_to(route_group)
+
+                PolyLineTextPath(
+                    route_line,
+                    "➤",
+                    repeat=True,
+                    offset=7,
+                    attributes={
+                        "fill": "white",
+                        "font-weight": "bold",
+                        "font-size": "17",
+                    },
+                ).add_to(campus_map)
+
+        # Unique stop colours and offset repeated visits so markers do not overlap.
+        marker_points = offset_marker_positions(
             building_ids,
+            buildings_m,
+            offset_m=5.0,
+        )
+
+        for stop_number, (building_id, marker_point_wgs) in enumerate(
+            zip(building_ids, marker_points),
             start=1,
         ):
             selected_wgs = buildings_wgs[
-                buildings_wgs["FID"]
-                == building_id
+                buildings_wgs["FID"] == building_id
             ]
 
-            selected_m = buildings_m[
-                buildings_m["FID"]
-                == building_id
-            ]
-
-            if (
-                selected_wgs.empty
-                or selected_m.empty
-            ):
+            if selected_wgs.empty or marker_point_wgs is None:
                 continue
 
-            marker_point_m = (
-                selected_m.geometry
-                .representative_point()
-                .iloc[0]
-            )
-
-            marker_point_wgs = (
-                gpd.GeoSeries(
-                    [marker_point_m],
-                    crs=PROJECTED_CRS,
-                )
-                .to_crs(WEB_CRS)
-                .iloc[0]
-            )
+            colour = STOP_COLOURS[(stop_number - 1) % len(STOP_COLOURS)]
 
             if stop_number == 1:
-                colour = START_COLOUR
-                label = (
-                    f"Start: "
-                    f"{get_building_name(building_id)}"
-                )
-
-            elif stop_number == len(
-                building_ids
-            ):
-                colour = DESTINATION_COLOUR
-                label = (
-                    f"Destination: "
-                    f"{get_building_name(building_id)}"
-                )
-
+                label = f"Start: {get_building_name(building_id)}"
+            elif stop_number == len(building_ids):
+                label = f"Destination: {get_building_name(building_id)}"
             else:
-                colour = INTERMEDIATE_COLOUR
-                label = (
-                    f"Stop {stop_number}: "
-                    f"{get_building_name(building_id)}"
-                )
+                label = f"Stop {stop_number}: {get_building_name(building_id)}"
 
             folium.GeoJson(
                 selected_wgs,
@@ -886,38 +973,37 @@ def create_map(
                         "color": c,
                         "weight": 3,
                         "fillColor": c,
-                        "fillOpacity": 0.75,
+                        "fillOpacity": 0.65,
                     }
                 ),
                 tooltip=folium.Tooltip(label),
             ).add_to(campus_map)
 
             folium.Marker(
-                location=[
-                    marker_point_wgs.y,
-                    marker_point_wgs.x,
-                ],
+                location=[marker_point_wgs.y, marker_point_wgs.x],
                 tooltip=label,
                 popup=label,
+                z_index_offset=1000 + stop_number,
                 icon=folium.DivIcon(
+                    icon_size=(34, 34),
+                    icon_anchor=(17, 17),
                     html=f"""
                     <div style="
                         background:{colour};
                         color:white;
                         border-radius:50%;
-                        width:28px;
-                        height:28px;
+                        width:32px;
+                        height:32px;
                         text-align:center;
-                        line-height:28px;
-                        font-weight:bold;
-                        border:2px solid white;
-                        box-shadow:
-                            0 1px 5px
-                            rgba(0,0,0,0.6);
+                        line-height:32px;
+                        font-weight:800;
+                        font-size:15px;
+                        border:3px solid white;
+                        box-shadow:0 2px 7px rgba(0,0,0,0.75);
                     ">
                         {stop_number}
                     </div>
-                    """
+                    """,
                 ),
             ).add_to(campus_map)
 
@@ -1332,15 +1418,10 @@ if st.button(
 
 
 # ============================================================
-# 14. GEMINI AI GIS ASSISTANT
+# 14. AI GIS COMMAND FORM
 # ============================================================
 
 st.subheader("AI GIS Assistant")
-
-st.caption(
-    "Gemini interprets your request and extracts the building FIDs. "
-    "The GIS engine performs the actual shortest-path analysis."
-)
 
 with st.form(
     key="gis_command_form",
@@ -1350,13 +1431,12 @@ with st.form(
         "Enter a route request",
         value=st.session_state.last_question,
         placeholder=(
-            "Example: Start at Building 10, visit Building 20, "
-            "then Building 35, and return to Building 10"
+            "Example: Start at Building 10, visit 20, 35, 50 and return to 10"
         ),
     )
 
     submitted = st.form_submit_button(
-        "Run AI GIS command",
+        "Ask GIS",
         type="primary",
     )
 
@@ -1369,111 +1449,56 @@ if submitted:
 
     else:
         parsed = None
-        interpreter_used = ""
+        interpreter_used = "Rule-based fallback"
 
-        # First choice: real Gemini interpretation.
         try:
-            gemini_key = str(
-                st.secrets.get("GEMINI_API_KEY", "")
-            ).strip()
-
-            if not gemini_key:
-                raise ValueError(
-                    "GEMINI_API_KEY is missing from Streamlit Secrets."
-                )
-
             with st.spinner("Gemini is interpreting your request..."):
                 parsed = interpret_gis_command(
                     question=question,
-                    api_key=gemini_key,
+                    api_key=st.secrets["GEMINI_API_KEY"],
                 )
-
-            interpreter_used = "Gemini"
+            interpreter_used = parsed.get("model_used", "Gemini")
+            st.success(f"Last language interpreter used: {interpreter_used}")
+            if parsed.get("reply"):
+                st.info(parsed["reply"])
 
         except Exception as gemini_error:
-            # Safe fallback: the older number-and-keyword parser.
             parsed = parse_command(question)
-            interpreter_used = "Rule-based fallback"
-
             st.warning(
-                "Gemini was unavailable, so the app used the "
-                f"rule-based fallback. Details: {gemini_error}"
+                "Gemini was unavailable, so the app used the rule-based "
+                f"fallback. Details: {gemini_error}"
             )
 
-        st.session_state.last_interpreter = interpreter_used
-        st.session_state.last_ai_reply = str(
-            parsed.get("reply", "")
-        ).strip()
+        if parsed and parsed.get("action") == "route":
+            building_ids = [int(value) for value in parsed.get("building_ids", [])]
 
-        if parsed.get("action") == "route":
-            building_ids = [
-                int(building_id)
-                for building_id in parsed.get(
-                    "building_ids",
-                    [],
-                )
-            ]
-
-            if len(building_ids) < 2:
+            if len(building_ids) > 10:
                 st.warning(
-                    "Please provide at least two building FIDs."
+                    "The map supports unique stop colours for the first 10 stops. "
+                    "Please use 10 stops or fewer for the clearest display."
                 )
 
-            else:
-                try:
-                    with st.spinner(
-                        "Running GIS shortest-path analysis..."
-                    ):
-                        (
-                            route_result,
-                            route_legs,
-                            total_distance,
-                        ) = calculate_multi_stop_route(
-                            building_ids
-                        )
-
-                    st.session_state.route_result = route_result
-                    st.session_state.route_legs = route_legs
-                    st.session_state.total_distance = total_distance
-                    st.session_state.selected_building_ids = (
-                        building_ids
+            try:
+                with st.spinner("Running GIS shortest-path analysis..."):
+                    route_result, route_legs, total_distance = (
+                        calculate_multi_stop_route(building_ids)
                     )
 
-                    if st.session_state.last_ai_reply:
-                        st.info(
-                            st.session_state.last_ai_reply
-                        )
+                st.session_state.route_result = route_result
+                st.session_state.route_legs = route_legs
+                st.session_state.total_distance = total_distance
+                st.session_state.selected_building_ids = building_ids
 
-                    st.success(
-                        "Route calculated successfully using "
-                        f"{interpreter_used} for language interpretation "
-                        "and the GIS engine for network analysis."
-                    )
+                st.success("Route calculated successfully.")
 
-                except Exception as error:
-                    st.error(
-                        "Unable to calculate route: "
-                        f"{error}"
-                    )
+            except Exception as error:
+                st.error(f"Unable to calculate route: {error}")
 
         else:
-            if st.session_state.last_ai_reply:
-                st.info(
-                    st.session_state.last_ai_reply
-                )
-
             st.warning(
-                "The request was not recognised as a route request. "
-                "Try: 'Find the shortest route from Building 10 "
-                "to Building 20'."
+                "The request was not recognised as a route. Include at least "
+                "two building FIDs, for example: route from Building 10 to Building 20."
             )
-
-
-if st.session_state.last_interpreter:
-    st.caption(
-        f"Last language interpreter used: "
-        f"{st.session_state.last_interpreter}"
-    )
 
 
 # ============================================================
@@ -1487,8 +1512,6 @@ if st.session_state.route_result is not None:
         st.session_state.total_distance = None
         st.session_state.selected_building_ids = None
         st.session_state.last_question = ""
-        st.session_state.last_ai_reply = ""
-        st.session_state.last_interpreter = ""
         st.rerun()
 
 
@@ -1498,47 +1521,77 @@ if st.session_state.route_result is not None:
 
 if (
     st.session_state.route_result is not None
-    and st.session_state.total_distance
-    is not None
+    and st.session_state.total_distance is not None
 ):
-    total_distance = (
-        st.session_state.total_distance
-    )
+    total_distance = st.session_state.total_distance
+    times = travel_time_estimates(total_distance)
 
-    walking_time = total_distance / 80.0
+    st.markdown("### Route summary")
 
-    result1, result2, result3 = st.columns(3)
-
-    with result1:
+    summary1, summary2 = st.columns(2)
+    with summary1:
         st.metric(
             "Stops",
-            len(
-                st.session_state
-                .selected_building_ids
-            ),
+            len(st.session_state.selected_building_ids),
         )
-
-    with result2:
+    with summary2:
         st.metric(
-            "Total distance",
+            "Total road distance",
             f"{total_distance:.1f} m",
         )
 
-    with result3:
-        st.metric(
-            "Estimated walking time",
-            f"{walking_time:.1f} min",
-        )
+    time1, time2, time3, time4 = st.columns(4)
+    with time1:
+        st.metric("🚶 Walking", times["Walking"])
+        st.caption("Assumed average speed: 4.8 km/h")
+    with time2:
+        st.metric("🚲 E-bike", times["E-bike"])
+        st.caption("Assumed average speed: 18 km/h")
+    with time3:
+        st.metric("🏍️ Motorcycle", times["Motorcycle"])
+        st.caption("Assumed average speed: 30 km/h")
+    with time4:
+        st.metric("🚗 Car driving", times["Car driving"])
+        st.caption("Assumed average speed: 45 km/h")
 
-    route_table = pd.DataFrame(
-        st.session_state.route_legs
+    st.caption(
+        "Travel times are simple estimates based on the same road-network "
+        "distance and assumed average speeds. They do not yet account for "
+        "traffic, road restrictions, junction delays, parking or vehicle access."
     )
 
+    route_table = pd.DataFrame(st.session_state.route_legs)
     st.dataframe(
         route_table,
         use_container_width=True,
         hide_index=True,
     )
+
+    st.markdown("#### Stop colour legend")
+    legend_columns = st.columns(min(10, len(st.session_state.selected_building_ids)))
+    for index, building_id in enumerate(st.session_state.selected_building_ids):
+        colour = STOP_COLOURS[index % len(STOP_COLOURS)]
+        with legend_columns[index % len(legend_columns)]:
+            st.markdown(
+                f"""
+                <div style="text-align:center; margin-bottom:8px;">
+                    <span style="
+                        display:inline-block;
+                        width:30px;
+                        height:30px;
+                        line-height:30px;
+                        border-radius:50%;
+                        background:{colour};
+                        color:white;
+                        font-weight:800;
+                        border:2px solid white;
+                        box-shadow:0 1px 4px rgba(0,0,0,.35);
+                    ">{index + 1}</span><br>
+                    <small>{get_building_name(building_id)}</small>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
 
 # ============================================================
