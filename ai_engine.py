@@ -1,120 +1,117 @@
+import random
+import time
 from typing import Literal
 
 from google import genai
+from google.genai import types
 from pydantic import BaseModel, Field
 
 
 # ============================================================
-# GEMINI STRUCTURED RESPONSE
+# STRUCTURED GIS COMMAND
 # ============================================================
 
 class GISCommand(BaseModel):
     action: Literal["route", "unknown"] = Field(
         description=(
-            "Use 'route' when the user asks for navigation, "
-            "shortest path, travel, walking, or routing between "
-            "building FIDs. Otherwise return 'unknown'."
+            "Use route when the user asks to travel, navigate, "
+            "walk, find a path, or calculate a route between "
+            "building FIDs. Otherwise use unknown."
         )
     )
 
     building_ids: list[int] = Field(
         description=(
-            "Building FIDs in the exact order requested by the user. "
-            "Return an empty list when the action is unknown."
+            "Building FIDs in the exact requested visiting order."
         )
     )
 
     reply: str = Field(
         description=(
-            "A brief explanation of what was understood. "
-            "Do not calculate distance, time, coordinates, or routes."
+            "Briefly explain the interpreted request. "
+            "Do not calculate distance, walking time, or coordinates."
         )
     )
 
 
-# ============================================================
-# SYSTEM INSTRUCTION
-# ============================================================
-
 SYSTEM_INSTRUCTION = """
-You are the natural-language interface for a university campus GIS.
+You are the natural-language interface for a campus GIS.
 
-The GIS currently supports road-network routing between building FIDs.
+The GIS currently supports shortest-path and multi-stop routing
+between building FIDs.
 
-Your task is only to:
-1. Understand the user's request.
-2. Identify whether the user wants a route.
-3. Extract building FIDs in the exact visiting order.
-4. Return structured JSON matching the required schema.
+Your only responsibilities are:
+1. Detect whether the user wants a route.
+2. Extract the building FIDs.
+3. Preserve their requested visiting order.
+4. Return structured JSON matching the supplied schema.
 
-Important rules:
-- Building FIDs are integers.
-- Preserve the order requested by the user.
-- Multi-stop routes are supported.
-- Repeated FIDs are allowed when returning to the starting building.
-- Never calculate route distance.
-- Never calculate walking time.
-- Never invent coordinates.
-- Never calculate the shortest path yourself.
-- The Python GIS engine performs all spatial calculations.
-- If fewer than two building FIDs are clearly provided, return:
-  action="unknown"
-  building_ids=[]
-- Ignore numbers representing times, dates, distances, or quantities
-  unless they clearly refer to building FIDs.
+Rules:
+- A building FID is an integer.
+- At least two FIDs are needed for a route.
+- Repeated FIDs are allowed for return journeys.
+- Do not calculate route distance.
+- Do not calculate walking time.
+- Do not invent coordinates.
+- The Python GIS engine performs the actual spatial analysis.
 
 Examples:
 
-User:
-Find the shortest route from Building 10 to Building 20
-
+User: Take me from Building 10 to Building 20
 Result:
-action="route"
-building_ids=[10, 20]
+action = route
+building_ids = [10, 20]
 
-User:
-Take me from building 10 to building 20 and then building 35
-
+User: Start at 10, visit 20 and 35, then return to 10
 Result:
-action="route"
-building_ids=[10, 20, 35]
+action = route
+building_ids = [10, 20, 35, 10]
 
-User:
-Start at Building 10, visit Building 20, then return to Building 10
-
+User: What is the weather?
 Result:
-action="route"
-building_ids=[10, 20, 10]
-
-User:
-I need to visit 15, then 30, then 40
-
-Result:
-action="route"
-building_ids=[15, 30, 40]
-
-User:
-What is the weather today?
-
-Result:
-action="unknown"
-building_ids=[]
+action = unknown
+building_ids = []
 """
 
 
-# ============================================================
-# GEMINI INTERPRETER
-# ============================================================
+# Try the lightweight model first.
+MODEL_LIST = [
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash",
+]
+
+
+def _call_model(
+    client,
+    model_name: str,
+    prompt: str,
+) -> GISCommand:
+    response = client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=GISCommand,
+        ),
+    )
+
+    if not response.text:
+        raise RuntimeError(
+            f"{model_name} returned an empty response."
+        )
+
+    return GISCommand.model_validate_json(response.text)
+
 
 def interpret_gis_command(
     question: str,
     api_key: str,
 ) -> dict:
     """
-    Convert a natural-language request into a controlled GIS command.
+    Interpret natural language using Gemini.
 
-    Gemini only determines the GIS action and extracts building FIDs.
-    NetworkX and GeoPandas perform the actual spatial analysis.
+    It tries multiple models and retries temporary server errors.
+    The GIS engine still performs all route calculations.
     """
 
     if not isinstance(question, str):
@@ -139,44 +136,56 @@ User request:
 {cleaned_question}
 """
 
-    interaction = client.interactions.create(
-        model="gemini-3.5-flash",
-        input=prompt,
-        response_format={
-            "type": "text",
-            "mime_type": "application/json",
-            "schema": GISCommand.model_json_schema(),
-        },
+    errors = []
+
+    # Each model gets up to three attempts.
+    for model_name in MODEL_LIST:
+        for attempt in range(3):
+            try:
+                command = _call_model(
+                    client=client,
+                    model_name=model_name,
+                    prompt=prompt,
+                )
+
+                command.building_ids = [
+                    int(building_id)
+                    for building_id in command.building_ids
+                ]
+
+                if (
+                    command.action == "route"
+                    and len(command.building_ids) < 2
+                ):
+                    command.action = "unknown"
+                    command.building_ids = []
+                    command.reply = (
+                        "Please provide at least two building FIDs."
+                    )
+
+                if command.action == "unknown":
+                    command.building_ids = []
+
+                result = command.model_dump()
+                result["model_used"] = model_name
+
+                return result
+
+            except Exception as error:
+                errors.append(
+                    f"{model_name}, attempt {attempt + 1}: "
+                    f"{error}"
+                )
+
+                # 1–2 sec, then 2–4 sec, then 4–8 sec.
+                if attempt < 2:
+                    delay = (2 ** attempt) + random.uniform(
+                        0.5,
+                        1.5,
+                    )
+                    time.sleep(delay)
+
+    raise RuntimeError(
+        "All Gemini models were temporarily unavailable. "
+        + " | ".join(errors)
     )
-
-    if not interaction.output_text:
-        raise RuntimeError(
-            "Gemini returned an empty response."
-        )
-
-    command = GISCommand.model_validate_json(
-        interaction.output_text
-    )
-
-    # Convert all returned IDs safely into integers
-    command.building_ids = [
-        int(building_id)
-        for building_id in command.building_ids
-    ]
-
-    # Final safety check
-    if (
-        command.action == "route"
-        and len(command.building_ids) < 2
-    ):
-        command.action = "unknown"
-        command.building_ids = []
-        command.reply = (
-            "Please provide at least two building FIDs "
-            "for route analysis."
-        )
-
-    if command.action == "unknown":
-        command.building_ids = []
-
-    return command.model_dump()
