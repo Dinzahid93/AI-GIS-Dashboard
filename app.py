@@ -1573,7 +1573,38 @@ if st.session_state.route_result is not None:
 
 
 # ============================================================
-# 16. ROUTE RESULTS
+# 16. DISPLAY MAP — ALWAYS VISIBLE BEFORE RESULTS
+# ============================================================
+
+# Rebuild the map using the current route state. The key changes whenever
+# the stop sequence changes, forcing Streamlit to refresh the map after
+# every new AI or manual route calculation.
+current_ids = st.session_state.selected_building_ids or []
+map_key = "campus_map_" + "_".join(str(x) for x in current_ids)
+if not current_ids:
+    map_key = "campus_map_default"
+
+campus_map = create_map(
+    route_result=st.session_state.route_result,
+    route_legs=st.session_state.route_legs,
+    total_distance=st.session_state.total_distance,
+    building_ids=st.session_state.selected_building_ids,
+)
+
+st.subheader("Route map" if current_ids else "Campus map")
+
+st_folium(
+    campus_map,
+    width=None,
+    height=720,
+    returned_objects=[],
+    use_container_width=True,
+    key=map_key,
+)
+
+
+# ============================================================
+# 17. ROUTE RESULTS
 # ============================================================
 
 if (
@@ -1651,25 +1682,3 @@ if (
         hide_index=True,
     )
 
-
-# ============================================================
-# 17. DISPLAY MAP
-# ============================================================
-
-campus_map = create_map(
-    route_result=st.session_state.route_result,
-    route_legs=st.session_state.route_legs,
-    total_distance=st.session_state.total_distance,
-    building_ids=(
-        st.session_state
-        .selected_building_ids
-    ),
-)
-
-st_folium(
-    campus_map,
-    width=None,
-    height=720,
-    returned_objects=[],
-    use_container_width=True,
-)
