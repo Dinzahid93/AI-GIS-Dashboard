@@ -111,6 +111,21 @@ TRAVEL_SPEEDS_KMH = {
 }
 
 
+SERVICE_AREA_COLOURS = {
+    "Walking": "#16A34A",
+    "E-bike": "#2563EB",
+    "Motorcycle": "#EA580C",
+    "Car driving": "#9333EA",
+}
+
+SERVICE_AREA_ICONS = {
+    "Walking": "🚶",
+    "E-bike": "🚲",
+    "Motorcycle": "🏍️",
+    "Car driving": "🚗",
+}
+
+
 # ============================================================
 # 4. SESSION STATE
 # ============================================================
@@ -147,6 +162,19 @@ if "multi_route_destination" not in st.session_state:
 
 if "independent_route_mode" not in st.session_state:
     st.session_state.independent_route_mode = None
+
+
+if "service_area_results" not in st.session_state:
+    st.session_state.service_area_results = None
+
+if "service_area_table" not in st.session_state:
+    st.session_state.service_area_table = None
+
+if "service_area_origin" not in st.session_state:
+    st.session_state.service_area_origin = None
+
+if "service_area_minutes" not in st.session_state:
+    st.session_state.service_area_minutes = None
 
 
 # ============================================================
@@ -648,6 +676,243 @@ def calculate_routes_from_origin_to_destinations(
 
 
 
+
+@st.cache_data(show_spinner=False)
+def map_buildings_to_network_nodes(_buildings_projected):
+    """
+    Snap every building representative point to the nearest node in
+    the main road network. The underscore prevents Streamlit from
+    hashing the GeoDataFrame.
+    """
+    records = []
+
+    for _, row in _buildings_projected.iterrows():
+        building_id = int(row["FID"])
+        point = row.geometry.representative_point()
+        node, snap_distance = nearest_main_node(point)
+
+        records.append(
+            {
+                "FID": building_id,
+                "network_node": node,
+                "snap_distance_m": float(snap_distance),
+            }
+        )
+
+    return pd.DataFrame(records)
+
+
+BUILDING_NODE_LOOKUP = map_buildings_to_network_nodes(buildings_m)
+
+
+def calculate_service_areas(
+    origin_id,
+    minutes,
+    travel_modes,
+):
+    """
+    Calculate network-based service areas from one building.
+
+    Each selected travel mode uses the same road graph but a different
+    distance cutoff derived from the assumed average speed.
+    """
+    origin_id = int(origin_id)
+    minutes = float(minutes)
+    travel_modes = list(dict.fromkeys(travel_modes))
+
+    if minutes <= 0:
+        raise ValueError("Travel time must be greater than zero minutes.")
+
+    if not travel_modes:
+        raise ValueError("Select at least one travel mode.")
+
+    invalid_modes = [
+        mode for mode in travel_modes
+        if mode not in TRAVEL_SPEEDS_KMH
+    ]
+    if invalid_modes:
+        raise ValueError(f"Unknown travel modes: {invalid_modes}")
+
+    origin_row = buildings_m[
+        buildings_m["FID"] == origin_id
+    ]
+    if origin_row.empty:
+        raise ValueError(f"Building {origin_id} was not found.")
+
+    origin_point = origin_row.geometry.representative_point().iloc[0]
+    origin_node, origin_snap_distance = nearest_main_node(origin_point)
+
+    service_results = []
+    summary_rows = []
+
+    building_nodes = BUILDING_NODE_LOOKUP.set_index("FID")
+
+    for mode_name in travel_modes:
+        speed_kmh = float(TRAVEL_SPEEDS_KMH[mode_name])
+        maximum_distance_m = speed_kmh * 1000.0 * (minutes / 60.0)
+
+        node_distances = nx.single_source_dijkstra_path_length(
+            G_MAIN,
+            source=origin_node,
+            cutoff=maximum_distance_m,
+            weight="weight",
+        )
+
+        reachable_nodes = set(node_distances.keys())
+
+        road_segments = []
+        for node_a, node_b, edge_data in G_MAIN.edges(data=True):
+            if node_a in reachable_nodes and node_b in reachable_nodes:
+                edge_geometry = edge_data.get("geometry")
+                if edge_geometry is not None and not edge_geometry.is_empty:
+                    road_segments.append(edge_geometry)
+
+        reachable_network = gpd.GeoDataFrame(
+            geometry=road_segments,
+            crs=PROJECTED_CRS,
+        )
+
+        reachable_building_ids = []
+        for building_id, building_data in building_nodes.iterrows():
+            network_node = building_data["network_node"]
+
+            if network_node not in node_distances:
+                continue
+
+            network_distance_m = float(node_distances[network_node])
+
+            # Include the origin with zero network distance.
+            if int(building_id) == origin_id:
+                network_distance_m = 0.0
+
+            estimated_seconds = (
+                network_distance_m / 1000.0 / speed_kmh
+            ) * 3600.0
+
+            reachable_building_ids.append(int(building_id))
+
+            summary_rows.append(
+                {
+                    "Origin building": origin_id,
+                    "Origin name": get_building_name(origin_id),
+                    "Reachable building": int(building_id),
+                    "Reachable name": get_building_name(building_id),
+                    "Travel mode": mode_name,
+                    "Time limit (min)": round(minutes, 1),
+                    "Maximum network distance (m)": round(
+                        maximum_distance_m,
+                        1,
+                    ),
+                    "Network distance (m)": round(
+                        network_distance_m,
+                        1,
+                    ),
+                    "Estimated travel time": format_duration(
+                        estimated_seconds
+                    ),
+                }
+            )
+
+        reachable_buildings = buildings_m[
+            buildings_m["FID"].isin(reachable_building_ids)
+        ].copy()
+
+        service_results.append(
+            {
+                "origin_id": origin_id,
+                "minutes": minutes,
+                "mode": mode_name,
+                "speed_kmh": speed_kmh,
+                "maximum_distance_m": maximum_distance_m,
+                "colour": SERVICE_AREA_COLOURS[mode_name],
+                "reachable_nodes": reachable_nodes,
+                "reachable_network": reachable_network,
+                "reachable_buildings": reachable_buildings,
+                "reachable_count": len(reachable_building_ids),
+                "origin_snap_distance_m": origin_snap_distance,
+            }
+        )
+
+    summary_table = pd.DataFrame(summary_rows)
+
+    if not summary_table.empty:
+        summary_table = summary_table.sort_values(
+            ["Travel mode", "Network distance (m)", "Reachable building"]
+        ).reset_index(drop=True)
+
+    return service_results, summary_table
+
+
+def service_area_table_to_csv(service_area_table):
+    return service_area_table.to_csv(
+        index=False
+    ).encode("utf-8-sig")
+
+
+def parse_service_area_command(question):
+    """
+    Recognise examples such as:
+    'Show buildings reachable within 5 minutes walking from Building 10.'
+    'Compare 5-minute walking, e-bike and driving service areas from Building 10.'
+    """
+    text = question.lower().strip()
+
+    service_phrases = [
+        "service area",
+        "isochrone",
+        "reachable within",
+        "can reach within",
+        "within",
+    ]
+
+    if not any(phrase in text for phrase in service_phrases):
+        return None
+
+    minute_match = re.search(
+        r"(\d+(?:\.\d+)?)\s*(?:minute|minutes|min)\b",
+        text,
+    )
+    building_match = re.search(
+        r"(?:from|around|starting at)\s+building\s*(\d+)",
+        text,
+    )
+
+    if building_match is None:
+        building_matches = re.findall(r"building\s*(\d+)", text)
+        building_id = int(building_matches[-1]) if building_matches else None
+    else:
+        building_id = int(building_match.group(1))
+
+    if minute_match is None or building_id is None:
+        return None
+
+    minutes = float(minute_match.group(1))
+    modes = []
+
+    if any(word in text for word in ["walk", "walking", "pedestrian"]):
+        modes.append("Walking")
+    if any(word in text for word in ["e-bike", "ebike", "e bike", "bicycle", "bike"]):
+        modes.append("E-bike")
+    if any(word in text for word in ["motorcycle", "motorbike"]):
+        modes.append("Motorcycle")
+    if any(word in text for word in ["drive", "driving", "car"]):
+        modes.append("Car driving")
+
+    if not modes:
+        modes = ["Walking"]
+
+    return {
+        "action": "service_area",
+        "origin_id": building_id,
+        "minutes": minutes,
+        "travel_modes": modes,
+        "reply": (
+            f"Calculating {minutes:g}-minute service areas from "
+            f"Building {building_id} for {', '.join(modes)}."
+        ),
+    }
+
+
 def parse_one_origin_multi_destination_command(question):
     """
     Recognise explicit one-origin to multiple-destination requests.
@@ -1110,6 +1375,8 @@ def create_map(
     building_ids=None,
     multi_route_results=None,
     multi_route_destination=None,
+    service_area_results=None,
+    service_area_origin=None,
 ):
     (
         minimum_x,
@@ -1192,8 +1459,140 @@ def create_map(
         ),
     ).add_to(campus_map)
 
+    # Network service area / isochrone results
+    if service_area_results:
+        all_service_bounds = []
+
+        for result in service_area_results:
+            mode_name = result["mode"]
+            colour = result["colour"]
+            minutes = float(result["minutes"])
+            maximum_distance_m = float(result["maximum_distance_m"])
+            reachable_network = result["reachable_network"]
+            reachable_buildings = result["reachable_buildings"]
+
+            mode_group = folium.FeatureGroup(
+                name=(
+                    f"{mode_name}: {minutes:g}-minute service area"
+                ),
+                show=True,
+            )
+
+            if (
+                reachable_network is not None
+                and not reachable_network.empty
+            ):
+                network_wgs = reachable_network.to_crs(WEB_CRS)
+                all_service_bounds.append(network_wgs.total_bounds)
+
+                folium.GeoJson(
+                    network_wgs,
+                    style_function=(
+                        lambda feature, c=colour: {
+                            "color": c,
+                            "weight": 6,
+                            "opacity": 0.72,
+                        }
+                    ),
+                    tooltip=folium.Tooltip(
+                        f"{mode_name} reachable road network<br>"
+                        f"Time limit: {minutes:g} minutes<br>"
+                        f"Distance cutoff: {maximum_distance_m:.1f} m",
+                        sticky=True,
+                    ),
+                ).add_to(mode_group)
+
+            if (
+                reachable_buildings is not None
+                and not reachable_buildings.empty
+            ):
+                reachable_buildings_wgs = (
+                    reachable_buildings.to_crs(WEB_CRS)
+                )
+
+                folium.GeoJson(
+                    reachable_buildings_wgs,
+                    style_function=(
+                        lambda feature, c=colour: {
+                            "color": c,
+                            "weight": 2.5,
+                            "fillColor": c,
+                            "fillOpacity": 0.45,
+                        }
+                    ),
+                    highlight_function=(
+                        lambda feature, c=colour: {
+                            "color": c,
+                            "weight": 4,
+                            "fillOpacity": 0.68,
+                        }
+                    ),
+                    tooltip=folium.GeoJsonTooltip(
+                        fields=["FID", "NAME"],
+                        aliases=[
+                            "Reachable building:",
+                            "Building name:",
+                        ],
+                        sticky=True,
+                    ),
+                ).add_to(mode_group)
+
+            mode_group.add_to(campus_map)
+
+        origin_id = int(service_area_origin)
+        origin_row = buildings_wgs[
+            buildings_wgs["FID"] == origin_id
+        ]
+
+        if not origin_row.empty:
+            origin_point = (
+                origin_row.geometry
+                .representative_point()
+                .iloc[0]
+            )
+
+            origin_label = (
+                f"Service-area origin {origin_id}: "
+                f"{get_building_name(origin_id)}"
+            )
+
+            folium.Marker(
+                [origin_point.y, origin_point.x],
+                tooltip=origin_label,
+                popup=origin_label,
+                icon=folium.DivIcon(
+                    html=f"""
+                    <div style="
+                        background:#111827;
+                        color:#FFFFFF;
+                        border-radius:50%;
+                        width:36px;
+                        height:36px;
+                        text-align:center;
+                        line-height:36px;
+                        font-weight:bold;
+                        border:3px solid white;
+                        box-shadow:0 1px 7px rgba(0,0,0,.75);
+                    ">
+                        {origin_id}
+                    </div>
+                    """
+                ),
+            ).add_to(campus_map)
+
+        if all_service_bounds:
+            min_x = min(bounds[0] for bounds in all_service_bounds)
+            min_y = min(bounds[1] for bounds in all_service_bounds)
+            max_x = max(bounds[2] for bounds in all_service_bounds)
+            max_y = max(bounds[3] for bounds in all_service_bounds)
+
+            campus_map.fit_bounds(
+                [[min_y, min_x], [max_y, max_x]],
+                padding=(45, 45),
+            )
+
     # Multiple independent routes: A → Z, B → Z, C → Z, etc.
-    if multi_route_results:
+    elif multi_route_results:
         all_route_bounds = []
 
         for result in multi_route_results:
@@ -1861,6 +2260,10 @@ if st.button(
         st.session_state.multi_route_table = None
         st.session_state.multi_route_destination = None
         st.session_state.independent_route_mode = None
+        st.session_state.service_area_results = None
+        st.session_state.service_area_table = None
+        st.session_state.service_area_origin = None
+        st.session_state.service_area_minutes = None
         st.success("Route calculated successfully.")
 
     except Exception as error:
@@ -1922,6 +2325,10 @@ if st.button(
         st.session_state.route_legs = None
         st.session_state.total_distance = None
         st.session_state.selected_building_ids = None
+        st.session_state.service_area_results = None
+        st.session_state.service_area_table = None
+        st.session_state.service_area_origin = None
+        st.session_state.service_area_minutes = None
 
         st.success(
             f"Calculated {len(multi_results)} separate shortest paths "
@@ -1996,6 +2403,10 @@ if st.button(
         st.session_state.route_legs = None
         st.session_state.total_distance = None
         st.session_state.selected_building_ids = None
+        st.session_state.service_area_results = None
+        st.session_state.service_area_table = None
+        st.session_state.service_area_origin = None
+        st.session_state.service_area_minutes = None
 
         st.success(
             f"Calculated {len(multi_results)} separate shortest paths "
@@ -2009,7 +2420,95 @@ if st.button(
 
 
 # ============================================================
-# 15. GEMINI AI GIS ASSISTANT
+# 16. SERVICE AREA / ISOCHRONE ANALYSIS
+# ============================================================
+
+st.subheader("Service Area (Isochrone)")
+
+st.caption(
+    "Select one starting building, a time limit and one or more travel "
+    "modes. The GIS engine highlights the road network and buildings "
+    "reachable within that time. Each travel mode uses its own assumed "
+    "average speed."
+)
+
+service_col1, service_col2, service_col3 = st.columns([2, 1, 2])
+
+with service_col1:
+    service_origin_label = st.selectbox(
+        "Starting building",
+        options=building_labels,
+        key="service_area_origin_select",
+    )
+
+with service_col2:
+    service_minutes = st.number_input(
+        "Travel-time limit (minutes)",
+        min_value=1.0,
+        max_value=120.0,
+        value=5.0,
+        step=1.0,
+        key="service_area_minutes_input",
+    )
+
+with service_col3:
+    service_modes = st.multiselect(
+        "Travel modes",
+        options=list(TRAVEL_SPEEDS_KMH.keys()),
+        default=["Walking"],
+        key="service_area_modes_select",
+    )
+
+st.caption(
+    "Example comparison: select Walking, E-bike and Car driving with "
+    "a 5-minute limit to compare how many buildings are reachable."
+)
+
+if st.button(
+    "Calculate service area",
+    type="primary",
+    key="calculate_service_area_button",
+):
+    try:
+        service_origin_id = building_label_to_fid[
+            service_origin_label
+        ]
+
+        with st.spinner(
+            "Calculating network service areas and reachable buildings..."
+        ):
+            service_results, service_table = calculate_service_areas(
+                origin_id=service_origin_id,
+                minutes=service_minutes,
+                travel_modes=service_modes,
+            )
+
+        st.session_state.service_area_results = service_results
+        st.session_state.service_area_table = service_table
+        st.session_state.service_area_origin = service_origin_id
+        st.session_state.service_area_minutes = float(service_minutes)
+
+        # Clear route outputs so different analyses do not overlap.
+        st.session_state.route_result = None
+        st.session_state.route_legs = None
+        st.session_state.total_distance = None
+        st.session_state.selected_building_ids = None
+        st.session_state.multi_route_results = None
+        st.session_state.multi_route_table = None
+        st.session_state.multi_route_destination = None
+        st.session_state.independent_route_mode = None
+
+        st.success(
+            f"Calculated {len(service_results)} service area(s) "
+            f"from Building {service_origin_id}."
+        )
+
+    except Exception as error:
+        st.error(f"Unable to calculate service area: {error}")
+
+
+# ============================================================
+# 17. GEMINI AI GIS ASSISTANT
 # ============================================================
 
 st.subheader("AI GIS Assistant")
@@ -2047,6 +2546,13 @@ with st.form(
 
         • **One Origin → Multiple Destinations:**  
         `Show separate shortest paths from Building 10 to Buildings 20, 30 and 40.`
+
+
+        • **Service Area — one mode:**  
+        `Show every building reachable within 5 minutes walking from Building 10.`
+
+        • **Service Area — compare modes:**  
+        `Compare 5-minute walking, e-bike and car driving service areas from Building 10.`
         """
     )
 
@@ -2063,22 +2569,29 @@ if submitted:
         st.warning("Please enter a route request.")
 
     else:
-        parsed = parse_one_origin_multi_destination_command(
+        parsed = parse_service_area_command(
             question
         )
 
         if parsed:
-            interpreter_used = (
-                "Built-in one-origin/multiple-destination parser"
-            )
+            interpreter_used = "Built-in service-area parser"
         else:
-            parsed = parse_multi_origin_command(
+            parsed = parse_one_origin_multi_destination_command(
                 question
             )
-            interpreter_used = (
-                "Built-in multiple-origin parser"
-                if parsed else ""
-            )
+
+            if parsed:
+                interpreter_used = (
+                    "Built-in one-origin/multiple-destination parser"
+                )
+            else:
+                parsed = parse_multi_origin_command(
+                    question
+                )
+                interpreter_used = (
+                    "Built-in multiple-origin parser"
+                    if parsed else ""
+                )
 
         # Use Gemini when the request is not an explicit multi-origin command.
         try:
@@ -2117,7 +2630,53 @@ if submitted:
             parsed.get("reply", "")
         ).strip()
 
-        if parsed.get("action") == "one_origin_multi_destination":
+        if parsed.get("action") == "service_area":
+            try:
+                origin_id = int(parsed.get("origin_id"))
+                minutes = float(parsed.get("minutes"))
+                travel_modes = list(
+                    parsed.get("travel_modes", ["Walking"])
+                )
+
+                with st.spinner(
+                    "Calculating GIS network service areas..."
+                ):
+                    service_results, service_table = (
+                        calculate_service_areas(
+                            origin_id=origin_id,
+                            minutes=minutes,
+                            travel_modes=travel_modes,
+                        )
+                    )
+
+                st.session_state.service_area_results = service_results
+                st.session_state.service_area_table = service_table
+                st.session_state.service_area_origin = origin_id
+                st.session_state.service_area_minutes = minutes
+
+                st.session_state.route_result = None
+                st.session_state.route_legs = None
+                st.session_state.total_distance = None
+                st.session_state.selected_building_ids = None
+                st.session_state.multi_route_results = None
+                st.session_state.multi_route_table = None
+                st.session_state.multi_route_destination = None
+                st.session_state.independent_route_mode = None
+
+                if st.session_state.last_ai_reply:
+                    st.info(st.session_state.last_ai_reply)
+
+                st.success(
+                    f"Calculated {len(service_results)} network "
+                    f"service area(s) from Building {origin_id}."
+                )
+
+            except Exception as error:
+                st.error(
+                    f"Unable to calculate service area: {error}"
+                )
+
+        elif parsed.get("action") == "one_origin_multi_destination":
             try:
                 origin_id = int(
                     parsed.get("origin_id")
@@ -2152,6 +2711,10 @@ if submitted:
                 st.session_state.route_legs = None
                 st.session_state.total_distance = None
                 st.session_state.selected_building_ids = None
+                st.session_state.service_area_results = None
+                st.session_state.service_area_table = None
+                st.session_state.service_area_origin = None
+                st.session_state.service_area_minutes = None
 
                 if st.session_state.last_ai_reply:
                     st.info(
@@ -2191,6 +2754,10 @@ if submitted:
                 st.session_state.route_legs = None
                 st.session_state.total_distance = None
                 st.session_state.selected_building_ids = None
+                st.session_state.service_area_results = None
+                st.session_state.service_area_table = None
+                st.session_state.service_area_origin = None
+                st.session_state.service_area_minutes = None
 
                 if st.session_state.last_ai_reply:
                     st.info(st.session_state.last_ai_reply)
@@ -2240,6 +2807,10 @@ if submitted:
                     st.session_state.multi_route_table = None
                     st.session_state.multi_route_destination = None
                     st.session_state.independent_route_mode = None
+                    st.session_state.service_area_results = None
+                    st.session_state.service_area_table = None
+                    st.session_state.service_area_origin = None
+                    st.session_state.service_area_minutes = None
 
                     if st.session_state.last_ai_reply:
                         st.info(
@@ -2285,6 +2856,7 @@ if st.session_state.last_interpreter:
 if (
     st.session_state.route_result is not None
     or st.session_state.multi_route_results is not None
+    or st.session_state.service_area_results is not None
 ):
     if st.button("Clear route"):
         st.session_state.route_result = None
@@ -2298,6 +2870,10 @@ if (
         st.session_state.multi_route_table = None
         st.session_state.multi_route_destination = None
         st.session_state.independent_route_mode = None
+        st.session_state.service_area_results = None
+        st.session_state.service_area_table = None
+        st.session_state.service_area_origin = None
+        st.session_state.service_area_minutes = None
         st.rerun()
 
 
@@ -2317,9 +2893,20 @@ campus_map = create_map(
     ),
     multi_route_results=st.session_state.multi_route_results,
     multi_route_destination=st.session_state.multi_route_destination,
+    service_area_results=st.session_state.service_area_results,
+    service_area_origin=st.session_state.service_area_origin,
 )
 
-if st.session_state.multi_route_results:
+if st.session_state.service_area_results:
+    map_ids = [
+        "service",
+        st.session_state.service_area_origin,
+        st.session_state.service_area_minutes,
+    ] + [
+        result["mode"]
+        for result in st.session_state.service_area_results
+    ]
+elif st.session_state.multi_route_results:
     map_ids = [
         result["origin_id"]
         for result in st.session_state.multi_route_results
@@ -2340,7 +2927,89 @@ st_folium(
 
 
 # ============================================================
-# 18. MULTIPLE-ORIGIN ROUTE RESULTS
+# 19. SERVICE AREA RESULTS
+# ============================================================
+
+if (
+    st.session_state.service_area_results is not None
+    and st.session_state.service_area_table is not None
+):
+    st.subheader("Service area results")
+
+    origin_id = int(st.session_state.service_area_origin)
+    minutes = float(st.session_state.service_area_minutes)
+
+    st.caption(
+        f"Buildings reachable from Building {origin_id} within "
+        f"{minutes:g} minutes using the selected travel modes. "
+        "Distances are calculated along the road network."
+    )
+
+    metric_columns = st.columns(
+        len(st.session_state.service_area_results)
+    )
+
+    for column, result in zip(
+        metric_columns,
+        st.session_state.service_area_results,
+    ):
+        with column:
+            mode_name = result["mode"]
+            st.metric(
+                f"{SERVICE_AREA_ICONS[mode_name]} {mode_name}",
+                f"{result['reachable_count']} buildings",
+            )
+            st.caption(
+                f"Maximum network distance: "
+                f"{result['maximum_distance_m']:.1f} m"
+            )
+
+    service_table = st.session_state.service_area_table.copy()
+
+    selected_mode_filter = st.multiselect(
+        "Filter result table by travel mode",
+        options=[
+            result["mode"]
+            for result in st.session_state.service_area_results
+        ],
+        default=[
+            result["mode"]
+            for result in st.session_state.service_area_results
+        ],
+        key="service_area_result_mode_filter",
+    )
+
+    filtered_service_table = service_table[
+        service_table["Travel mode"].isin(selected_mode_filter)
+    ].copy()
+
+    st.dataframe(
+        filtered_service_table,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.download_button(
+        label="Download service area results as CSV",
+        data=service_area_table_to_csv(service_table),
+        file_name=(
+            f"service_area_building_{origin_id}_"
+            f"{minutes:g}_minutes.csv"
+        ),
+        mime="text/csv",
+        key="download_service_area_csv",
+    )
+
+    st.caption(
+        "The current analysis uses assumed constant average speeds and "
+        "the same road network for all modes. It does not yet enforce "
+        "mode-specific restrictions such as pedestrian-only paths, "
+        "vehicle access, stairs, traffic or junction delays."
+    )
+
+
+# ============================================================
+# 20. MULTIPLE-ORIGIN ROUTE RESULTS
 # ============================================================
 
 if (
