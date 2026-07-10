@@ -1,4 +1,5 @@
 from pathlib import Path
+import math
 import re
 
 import folium
@@ -10,7 +11,7 @@ import streamlit as st
 from ai_engine import interpret_gis_command
 
 from branca.element import MacroElement
-from folium.plugins import Fullscreen, PolyLineTextPath
+from folium.plugins import Fullscreen
 from jinja2 import Template
 from scipy.spatial import cKDTree
 from shapely.geometry import LineString
@@ -93,10 +94,17 @@ PROJECTED_CRS = "EPSG:32647"
 BUILDING_COLOUR = "#F39C12"
 ROAD_COLOUR = "#8B4513"
 ROUTE_COLOUR = "#E74C3C"
-START_COLOUR = "#2ECC71"
-DESTINATION_COLOUR = "#3498DB"
-INTERMEDIATE_COLOUR = "#8E44AD"
-STOP_COLOUR = "#FFD700"
+STOP_COLOUR = "#FFD700"  # All route stops use yellow
+START_COLOUR = STOP_COLOUR
+DESTINATION_COLOUR = STOP_COLOUR
+INTERMEDIATE_COLOUR = STOP_COLOUR
+
+TRAVEL_SPEEDS_KMH = {
+    "Walking": 4.8,
+    "E-bike": 18.0,
+    "Motorcycle": 30.0,
+    "Car driving": 45.0,
+}
 
 
 # ============================================================
@@ -368,8 +376,15 @@ def shortest_route_between_buildings(
 
         edge = G_MAIN[node_a][node_b]
 
+        edge_geometry = edge["geometry"]
+        edge_coordinates = list(edge_geometry.coords)
+
+        # Ensure every route segment follows the actual travel direction.
+        if tuple(edge_coordinates[0]) != tuple(node_a):
+            edge_coordinates.reverse()
+
         route_segments.append(
-            LineString([node_a, node_b])
+            LineString(edge_coordinates)
         )
 
         total_distance += float(
@@ -523,35 +538,90 @@ def get_building_name(building_id):
     return name if name else f"Building {building_id}"
 
 
-
-def estimate_travel_seconds(
-    distance_m,
-    speed_kmh,
-):
-    """Estimate travel time using distance and assumed average speed."""
-    metres_per_second = speed_kmh * 1000 / 3600
-    return int(round(distance_m / metres_per_second))
-
-
 def format_duration(total_seconds):
-    """Display travel time as hours, minutes and seconds."""
-    total_seconds = max(0, int(total_seconds))
+    total_seconds = max(0, int(round(total_seconds)))
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
 
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours} hr {minutes} min {seconds} sec"
+    if minutes > 0:
+        return f"{minutes} min {seconds} sec"
+    return f"{seconds} sec"
 
-    parts = []
 
-    if hours:
-        parts.append(f"{hours} hr")
+def add_direction_arrows(map_object, route_projected):
+    """Add robust directional arrow markers without custom Leaflet plugins."""
+    if route_projected is None or route_projected.empty:
+        return
 
-    if minutes:
-        parts.append(f"{minutes} min")
+    arrow_group = folium.FeatureGroup(
+        name="Route Direction Arrows",
+        show=True,
+    )
 
-    if seconds or not parts:
-        parts.append(f"{seconds} sec")
+    # Add one arrow approximately every 70 metres of route.
+    spacing_m = 70.0
+    distance_since_arrow = 0.0
 
-    return " ".join(parts)
+    for geometry in route_projected.geometry:
+        if geometry is None or geometry.is_empty:
+            continue
+
+        coords = list(geometry.coords)
+        if len(coords) < 2:
+            continue
+
+        segment_length = float(geometry.length)
+        distance_since_arrow += segment_length
+
+        if distance_since_arrow < spacing_m:
+            continue
+
+        distance_since_arrow = 0.0
+
+        start_x, start_y = coords[0]
+        end_x, end_y = coords[-1]
+        angle = math.degrees(
+            math.atan2(end_y - start_y, end_x - start_x)
+        )
+
+        midpoint_projected = geometry.interpolate(0.5, normalized=True)
+        midpoint_wgs = (
+            gpd.GeoSeries([midpoint_projected], crs=PROJECTED_CRS)
+            .to_crs(WEB_CRS)
+            .iloc[0]
+        )
+
+        folium.Marker(
+            location=[midpoint_wgs.y, midpoint_wgs.x],
+            tooltip="Route direction",
+            icon=folium.DivIcon(
+                icon_size=(30, 30),
+                icon_anchor=(15, 15),
+                html=f"""
+                <div style="
+                    width:30px;
+                    height:30px;
+                    display:flex;
+                    align-items:center;
+                    justify-content:center;
+                    transform:rotate({-angle}deg);
+                    color:#FFFFFF;
+                    font-size:24px;
+                    font-weight:900;
+                    text-shadow:
+                        -2px -2px 0 {ROUTE_COLOUR},
+                         2px -2px 0 {ROUTE_COLOUR},
+                        -2px  2px 0 {ROUTE_COLOUR},
+                         2px  2px 0 {ROUTE_COLOUR};
+                "
+                >➤</div>
+                """,
+            ),
+        ).add_to(arrow_group)
+
+    arrow_group.add_to(map_object)
 
 
 # ============================================================
@@ -851,53 +921,11 @@ def create_map(
             ),
         ).add_to(campus_map)
 
-        # Direction arrows for each route leg.
-        # The route geometries are stored in travel order, so the arrows
-        # indicate the actual movement from one stop to the next.
-        if "leg" in route_wgs.columns:
-            for _, leg_group in route_wgs.groupby(
-                "leg",
-                sort=False,
-            ):
-                leg_locations = []
-
-                for geometry in leg_group.geometry:
-                    coordinates = list(geometry.coords)
-
-                    for coordinate_index, (x, y) in enumerate(
-                        coordinates
-                    ):
-                        point = [y, x]
-
-                        if (
-                            leg_locations
-                            and point == leg_locations[-1]
-                        ):
-                            continue
-
-                        leg_locations.append(point)
-
-                if len(leg_locations) >= 2:
-                    arrow_line = folium.PolyLine(
-                        locations=leg_locations,
-                        color=ROUTE_COLOUR,
-                        weight=1,
-                        opacity=0.01,
-                    ).add_to(campus_map)
-
-                    PolyLineTextPath(
-                        arrow_line,
-                        "➤",
-                        repeat=True,
-                        offset=8,
-                        attributes={
-                            "fill": "#FFFFFF",
-                            "font-size": "16",
-                            "font-weight": "bold",
-                            "stroke": ROUTE_COLOUR,
-                            "stroke-width": "1.4",
-                        },
-                    ).add_to(campus_map)
+        # Add arrows that follow the actual ordered route segments.
+        add_direction_arrows(
+            map_object=campus_map,
+            route_projected=route_result,
+        )
 
         # Selected stop buildings
         for stop_number, building_id in enumerate(
@@ -935,10 +963,8 @@ def create_map(
                 .iloc[0]
             )
 
-            # All route stops use the same yellow colour.
-            colour = STOP_COLOUR
-
             if stop_number == 1:
+                colour = START_COLOUR
                 label = (
                     f"Start: "
                     f"{get_building_name(building_id)}"
@@ -947,12 +973,14 @@ def create_map(
             elif stop_number == len(
                 building_ids
             ):
+                colour = DESTINATION_COLOUR
                 label = (
                     f"Destination: "
                     f"{get_building_name(building_id)}"
                 )
 
             else:
+                colour = INTERMEDIATE_COLOUR
                 label = (
                     f"Stop {stop_number}: "
                     f"{get_building_name(building_id)}"
@@ -983,7 +1011,7 @@ def create_map(
                     html=f"""
                     <div style="
                         background:{colour};
-                        color:white;
+                        color:#111111;
                         border-radius:50%;
                         width:28px;
                         height:28px;
@@ -1075,25 +1103,10 @@ st.caption(
     "building footprints and road-network analysis."
 )
 
-metric1, metric2, metric3 = st.columns(3)
-
-with metric1:
-    st.metric(
-        "Buildings",
-        f"{len(buildings_wgs):,}",
-    )
-
-with metric2:
-    st.metric(
-        "Road features",
-        f"{len(roads_wgs):,}",
-    )
-
-with metric3:
-    st.metric(
-        "Road-network groups",
-        ROAD_GROUP_COUNT,
-    )
+st.metric(
+    "Buildings",
+    f"{len(buildings_wgs):,}",
+)
 
 
 # ============================================================
@@ -1573,25 +1586,27 @@ if st.session_state.route_result is not None:
 
 
 # ============================================================
-# 16. DISPLAY MAP — ALWAYS VISIBLE BEFORE RESULTS
+# 16. DISPLAY MAP FIRST
 # ============================================================
 
-# Rebuild the map using the current route state. The key changes whenever
-# the stop sequence changes, forcing Streamlit to refresh the map after
-# every new AI or manual route calculation.
-current_ids = st.session_state.selected_building_ids or []
-map_key = "campus_map_" + "_".join(str(x) for x in current_ids)
-if not current_ids:
-    map_key = "campus_map_default"
+st.subheader("Route map")
 
 campus_map = create_map(
     route_result=st.session_state.route_result,
     route_legs=st.session_state.route_legs,
     total_distance=st.session_state.total_distance,
-    building_ids=st.session_state.selected_building_ids,
+    building_ids=(
+        st.session_state
+        .selected_building_ids
+    ),
 )
 
-st.subheader("Route map" if current_ids else "Campus map")
+map_key = "main_route_map_" + "_".join(
+    str(building_id)
+    for building_id in (
+        st.session_state.selected_building_ids or ["default"]
+    )
+)
 
 st_folium(
     campus_map,
@@ -1604,66 +1619,49 @@ st_folium(
 
 
 # ============================================================
-# 17. ROUTE RESULTS
+# 17. ROUTE RESULTS AND TRAVEL TIMES
 # ============================================================
 
 if (
     st.session_state.route_result is not None
-    and st.session_state.total_distance
-    is not None
+    and st.session_state.total_distance is not None
 ):
-    total_distance = float(
-        st.session_state.total_distance
-    )
+    total_distance = float(st.session_state.total_distance)
+    distance_km = total_distance / 1000.0
 
     st.subheader("Route summary")
 
-    summary1, summary2 = st.columns(2)
+    result1, result2 = st.columns(2)
 
-    with summary1:
+    with result1:
         st.metric(
             "Stops",
-            len(
-                st.session_state
-                .selected_building_ids
-            ),
+            len(st.session_state.selected_building_ids),
         )
 
-    with summary2:
+    with result2:
         st.metric(
             "Total road distance",
             f"{total_distance:.1f} m",
         )
 
-    # Simple travel-time estimates based on the same route distance.
-    # These values do not yet account for congestion, parking,
-    # junction delays, access restrictions or pedestrian-only roads.
-    travel_modes = [
-        ("🚶 Walking", 4.8),
-        ("🚲 E-bike", 18.0),
-        ("🏍️ Motorcycle", 30.0),
-        ("🚗 Car driving", 45.0),
-    ]
+    time_columns = st.columns(4)
+    icons = ["🚶", "🚲", "🏍️", "🚗"]
 
-    travel_columns = st.columns(4)
-
-    for column, (mode_name, speed_kmh) in zip(
-        travel_columns,
-        travel_modes,
+    for column, icon, (mode_name, speed_kmh) in zip(
+        time_columns,
+        icons,
+        TRAVEL_SPEEDS_KMH.items(),
     ):
-        travel_seconds = estimate_travel_seconds(
-            total_distance,
-            speed_kmh,
-        )
+        travel_seconds = (distance_km / speed_kmh) * 3600.0
 
         with column:
             st.metric(
-                mode_name,
+                f"{icon} {mode_name}",
                 format_duration(travel_seconds),
             )
             st.caption(
-                f"Assumed average speed: "
-                f"{speed_kmh:g} km/h"
+                f"Assumed average speed: {speed_kmh:g} km/h"
             )
 
     st.caption(
@@ -1681,4 +1679,3 @@ if (
         use_container_width=True,
         hide_index=True,
     )
-
