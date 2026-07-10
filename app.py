@@ -10,7 +10,7 @@ import streamlit as st
 from ai_engine import interpret_gis_command
 
 from branca.element import MacroElement
-from folium.plugins import Fullscreen
+from folium.plugins import Fullscreen, PolyLineTextPath
 from jinja2 import Template
 from scipy.spatial import cKDTree
 from shapely.geometry import LineString
@@ -96,6 +96,28 @@ ROUTE_COLOUR = "#E74C3C"
 START_COLOUR = "#2ECC71"
 DESTINATION_COLOUR = "#3498DB"
 INTERMEDIATE_COLOUR = "#8E44AD"
+
+# Unique stop colours for up to 10 stops
+STOP_COLOURS = [
+    "#1976D2",  # 1 Blue
+    "#EF6C00",  # 2 Orange
+    "#2E7D32",  # 3 Green
+    "#7B1FA2",  # 4 Purple
+    "#D32F2F",  # 5 Red
+    "#795548",  # 6 Brown
+    "#C2185B",  # 7 Pink
+    "#616161",  # 8 Grey
+    "#C0A000",  # 9 Gold
+    "#0097A7",  # 10 Cyan
+]
+
+# Simple travel-time assumptions
+TRAVEL_SPEEDS_KMH = {
+    "Walking": 4.8,
+    "E-bike": 18.0,
+    "Motorcycle": 30.0,
+    "Car driving": 45.0,
+}
 
 
 # ============================================================
@@ -367,8 +389,17 @@ def shortest_route_between_buildings(
 
         edge = G_MAIN[node_a][node_b]
 
+        segment_geometry = edge["geometry"]
+
+        # Ensure every route segment follows the actual travel direction.
+        segment_coordinates = list(segment_geometry.coords)
+        if tuple(segment_coordinates[0]) != tuple(node_a):
+            segment_geometry = LineString(
+                list(reversed(segment_coordinates))
+            )
+
         route_segments.append(
-            edge["geometry"]
+            segment_geometry
         )
 
         total_distance += float(
@@ -520,6 +551,44 @@ def get_building_name(building_id):
 
     name = str(row.iloc[0].get("NAME", "")).strip()
     return name if name else f"Building {building_id}"
+
+
+def format_travel_time(distance_m, speed_kmh):
+    """Return a readable travel time from distance and assumed speed."""
+    total_seconds = round(
+        float(distance_m) / (float(speed_kmh) * 1000 / 3600)
+    )
+
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+
+    if hours > 0:
+        return f"{hours} hr {minutes} min {seconds} sec"
+    if minutes > 0:
+        return f"{minutes} min {seconds} sec"
+    return f"{seconds} sec"
+
+
+def get_stop_colour(stop_number):
+    """Return one of 10 fixed, unique stop colours."""
+    return STOP_COLOURS[(stop_number - 1) % len(STOP_COLOURS)]
+
+
+def offset_marker_location(latitude, longitude, occurrence_index):
+    """
+    Slightly separate repeated stops at the same building so that
+    the start marker and return marker remain visible.
+    """
+    if occurrence_index == 0:
+        return latitude, longitude
+
+    offset_distance = 0.000045 * occurrence_index
+    angle = occurrence_index * 2.399963229728653
+
+    offset_latitude = latitude + offset_distance * np.sin(angle)
+    offset_longitude = longitude + offset_distance * np.cos(angle)
+
+    return offset_latitude, offset_longitude
 
 
 # ============================================================
@@ -781,9 +850,13 @@ def create_map(
             WEB_CRS
         )
 
-        walking_time = (
-            total_distance / 80.0
-        )
+        travel_times = {
+            mode: format_travel_time(
+                total_distance,
+                speed,
+            )
+            for mode, speed in TRAVEL_SPEEDS_KMH.items()
+        }
 
         leg_text = ""
 
@@ -801,13 +874,25 @@ def create_map(
             f"{leg_text}"
             f"<b>Total distance:</b> "
             f"{total_distance:.1f} m<br>"
-            f"<b>Walking time:</b> "
-            f"{walking_time:.1f} min"
+            f"<b>Walking:</b> "
+            f"{travel_times['Walking']}<br>"
+            f"<b>E-bike:</b> "
+            f"{travel_times['E-bike']}<br>"
+            f"<b>Motorcycle:</b> "
+            f"{travel_times['Motorcycle']}<br>"
+            f"<b>Car driving:</b> "
+            f"{travel_times['Car driving']}"
         )
 
+        route_layer = folium.FeatureGroup(
+            name="Calculated Route",
+            show=True,
+        )
+        route_layer.add_to(campus_map)
+
+        # Main route line
         folium.GeoJson(
             route_wgs,
-            name="Calculated Route",
             style_function=lambda feature: {
                 "color": ROUTE_COLOUR,
                 "weight": 7,
@@ -817,9 +902,52 @@ def create_map(
                 route_summary,
                 sticky=True,
             ),
-        ).add_to(campus_map)
+        ).add_to(route_layer)
 
-        # Selected stop buildings
+        # Direction arrows. Route segments were oriented in the same
+        # direction as travel inside shortest_route_between_buildings().
+        for geometry in route_wgs.geometry:
+            if geometry is None or geometry.is_empty:
+                continue
+
+            if geometry.geom_type == "LineString":
+                line_geometries = [geometry]
+            elif geometry.geom_type == "MultiLineString":
+                line_geometries = list(geometry.geoms)
+            else:
+                continue
+
+            for line_geometry in line_geometries:
+                arrow_line = folium.PolyLine(
+                    locations=[
+                        (latitude, longitude)
+                        for longitude, latitude
+                        in line_geometry.coords
+                    ],
+                    color=ROUTE_COLOUR,
+                    weight=1,
+                    opacity=0.01,
+                )
+                arrow_line.add_to(route_layer)
+
+                PolyLineTextPath(
+                    arrow_line,
+                    "➤",
+                    repeat=True,
+                    offset=7,
+                    attributes={
+                        "fill": "#FFFFFF",
+                        "font-size": "18",
+                        "font-weight": "bold",
+                        "stroke": ROUTE_COLOUR,
+                        "stroke-width": "1.5",
+                        "paint-order": "stroke",
+                    },
+                ).add_to(route_layer)
+
+        # Selected stop buildings and markers
+        building_occurrences = {}
+
         for stop_number, building_id in enumerate(
             building_ids,
             start=1,
@@ -855,24 +983,19 @@ def create_map(
                 .iloc[0]
             )
 
+            colour = get_stop_colour(stop_number)
+
             if stop_number == 1:
-                colour = START_COLOUR
                 label = (
                     f"Start: "
                     f"{get_building_name(building_id)}"
                 )
-
-            elif stop_number == len(
-                building_ids
-            ):
-                colour = DESTINATION_COLOUR
+            elif stop_number == len(building_ids):
                 label = (
                     f"Destination: "
                     f"{get_building_name(building_id)}"
                 )
-
             else:
-                colour = INTERMEDIATE_COLOUR
                 label = (
                     f"Stop {stop_number}: "
                     f"{get_building_name(building_id)}"
@@ -886,34 +1009,55 @@ def create_map(
                         "color": c,
                         "weight": 3,
                         "fillColor": c,
-                        "fillOpacity": 0.75,
+                        "fillOpacity": 0.68,
                     }
                 ),
                 tooltip=folium.Tooltip(label),
             ).add_to(campus_map)
 
-            folium.Marker(
-                location=[
+            occurrence_index = building_occurrences.get(
+                int(building_id),
+                0,
+            )
+            building_occurrences[int(building_id)] = (
+                occurrence_index + 1
+            )
+
+            marker_latitude, marker_longitude = (
+                offset_marker_location(
                     marker_point_wgs.y,
                     marker_point_wgs.x,
+                    occurrence_index,
+                )
+            )
+
+            folium.Marker(
+                location=[
+                    marker_latitude,
+                    marker_longitude,
                 ],
                 tooltip=label,
-                popup=label,
+                popup=(
+                    f"<b>{label}</b><br>"
+                    f"FID: {building_id}<br>"
+                    f"Stop order: {stop_number}"
+                ),
                 icon=folium.DivIcon(
                     html=f"""
                     <div style="
                         background:{colour};
                         color:white;
                         border-radius:50%;
-                        width:28px;
-                        height:28px;
+                        width:32px;
+                        height:32px;
                         text-align:center;
-                        line-height:28px;
+                        line-height:32px;
                         font-weight:bold;
-                        border:2px solid white;
+                        font-size:15px;
+                        border:3px solid white;
                         box-shadow:
-                            0 1px 5px
-                            rgba(0,0,0,0.6);
+                            0 1px 6px
+                            rgba(0,0,0,0.75);
                     ">
                         {stop_number}
                     </div>
@@ -1501,34 +1645,63 @@ if (
     and st.session_state.total_distance
     is not None
 ):
-    total_distance = (
+    total_distance = float(
         st.session_state.total_distance
     )
 
-    walking_time = total_distance / 80.0
+    selected_ids = (
+        st.session_state.selected_building_ids
+        or []
+    )
 
-    result1, result2, result3 = st.columns(3)
+    st.markdown("## Route summary")
 
-    with result1:
+    summary_col1, summary_col2 = st.columns(2)
+
+    with summary_col1:
         st.metric(
             "Stops",
-            len(
-                st.session_state
-                .selected_building_ids
-            ),
+            len(selected_ids),
         )
 
-    with result2:
+    with summary_col2:
         st.metric(
-            "Total distance",
+            "Total road distance",
             f"{total_distance:.1f} m",
         )
 
-    with result3:
-        st.metric(
-            "Estimated walking time",
-            f"{walking_time:.1f} min",
-        )
+    travel_columns = st.columns(4)
+
+    travel_modes = [
+        ("🚶 Walking", "Walking"),
+        ("🚲 E-bike", "E-bike"),
+        ("🏍️ Motorcycle", "Motorcycle"),
+        ("🚗 Car driving", "Car driving"),
+    ]
+
+    for column, (label, mode) in zip(
+        travel_columns,
+        travel_modes,
+    ):
+        with column:
+            speed = TRAVEL_SPEEDS_KMH[mode]
+            st.metric(
+                label,
+                format_travel_time(
+                    total_distance,
+                    speed,
+                ),
+            )
+            st.caption(
+                f"Assumed average speed: {speed:g} km/h"
+            )
+
+    st.caption(
+        "Travel times are simple estimates based on the same "
+        "road-network distance and assumed average speeds. "
+        "They do not yet account for traffic, road restrictions, "
+        "junction delays, parking or vehicle access."
+    )
 
     route_table = pd.DataFrame(
         st.session_state.route_legs
@@ -1539,6 +1712,45 @@ if (
         use_container_width=True,
         hide_index=True,
     )
+
+    st.markdown("### Stop colour legend")
+
+    legend_columns = st.columns(
+        min(len(selected_ids), 10)
+    )
+
+    for index, building_id in enumerate(
+        selected_ids[:10],
+        start=1,
+    ):
+        column = legend_columns[index - 1]
+
+        with column:
+            colour = get_stop_colour(index)
+            st.markdown(
+                f"""
+                <div style="text-align:center;">
+                    <div style="
+                        display:inline-block;
+                        background:{colour};
+                        color:white;
+                        width:34px;
+                        height:34px;
+                        line-height:34px;
+                        border-radius:50%;
+                        font-weight:bold;
+                        border:2px solid white;
+                        box-shadow:0 1px 4px rgba(0,0,0,0.4);
+                    ">
+                        {index}
+                    </div>
+                    <div style="margin-top:6px;">
+                        {get_building_name(building_id)}
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
 
 # ============================================================
