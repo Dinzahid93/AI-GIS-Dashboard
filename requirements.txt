@@ -1,10 +1,11 @@
 streamlit
-folium
 streamlit-folium
+folium
 geopandas
 networkx
 scipy
 shapely
 pyproj
-pandas
 numpy
+pandas
+requests
