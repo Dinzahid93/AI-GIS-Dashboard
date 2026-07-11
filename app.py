@@ -1937,7 +1937,7 @@ def create_map(
 st.title("🗺️ LLM Powered UiTM Shah Alam Campus Map")
 
 st.caption(
-    "Ask the AI GIS Assistant to run routing and service-area analyses. "
+    "Explore the campus through an interactive GIS map powered by a Large Language Model (LLM) using Google Gemini. Instantly retrieve routes, accessibility, and spatial information through natural language queries or the manual GIS tools below. This dashboard is built using Streamlit and open-source GIS libraries to provide an interactive web-based spatial analysis platform."
     "Manual tools remain available below in collapsible panels."
 )
 
