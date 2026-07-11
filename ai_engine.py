@@ -37,15 +37,38 @@ def _clean_result(result: dict[str, Any]) -> dict[str, Any]:
     reply = str(result.get("reply", "")).strip()
 
     if action == "service_area":
-        origin_id = int(result["origin_id"])
-        minutes = float(result["minutes"])
+        origin_value = result.get("origin_id")
+        minutes_value = result.get("minutes")
+
+        if origin_value is None:
+            raise ValueError(
+                "Gemini did not provide an origin building for the service area."
+            )
+
+        if minutes_value is None:
+            raise ValueError(
+                "Gemini did not provide a travel-time limit for the service area."
+            )
+
+        origin_id = int(origin_value)
+        minutes = float(minutes_value)
 
         raw_modes = result.get("travel_modes") or ["Walking"]
         modes: list[str] = []
+
         for raw_mode in raw_modes:
             mode_text = str(raw_mode).strip()
-            canonical = SUPPORTED_MODES.get(mode_text.lower(), mode_text)
-            if canonical in {"Walking", "E-bike", "Motorcycle", "Car driving"}:
+            canonical = SUPPORTED_MODES.get(
+                mode_text.lower(),
+                mode_text,
+            )
+
+            if canonical in {
+                "Walking",
+                "E-bike",
+                "Motorcycle",
+                "Car driving",
+            }:
                 if canonical not in modes:
                     modes.append(canonical)
 
@@ -53,7 +76,9 @@ def _clean_result(result: dict[str, Any]) -> dict[str, Any]:
             modes = ["Walking"]
 
         if minutes <= 0:
-            raise ValueError("Service-area minutes must be greater than zero.")
+            raise ValueError(
+                "Service-area minutes must be greater than zero."
+            )
 
         return {
             "action": "service_area",
@@ -67,60 +92,125 @@ def _clean_result(result: dict[str, Any]) -> dict[str, Any]:
         }
 
     if action == "multi_origin_route":
-        origin_ids = [int(value) for value in result.get("origin_ids", [])]
-        destination_id = int(result["destination_id"])
+        origin_ids = [
+            int(value)
+            for value in result.get("origin_ids", [])
+        ]
+
+        destination_value = result.get("destination_id")
+
+        if not origin_ids:
+            raise ValueError(
+                "Gemini did not provide origin buildings."
+            )
+
+        if destination_value is None:
+            raise ValueError(
+                "Gemini did not provide a destination building."
+            )
+
+        destination_id = int(destination_value)
+
         return {
-            "action": action,
+            "action": "multi_origin_route",
             "origin_ids": origin_ids,
             "destination_id": destination_id,
-            "reply": reply,
+            "reply": reply or (
+                f"Calculating separate shortest paths from Buildings "
+                f"{origin_ids} to Building {destination_id}."
+            ),
         }
 
     if action == "one_origin_multi_destination":
-        origin_id = int(result["origin_id"])
+        origin_value = result.get("origin_id")
         destination_ids = [
-            int(value) for value in result.get("destination_ids", [])
+            int(value)
+            for value in result.get("destination_ids", [])
         ]
+
+        if origin_value is None:
+            raise ValueError(
+                "Gemini did not provide an origin building."
+            )
+
+        if not destination_ids:
+            raise ValueError(
+                "Gemini did not provide destination buildings."
+            )
+
+        origin_id = int(origin_value)
+
         return {
-            "action": action,
+            "action": "one_origin_multi_destination",
             "origin_id": origin_id,
             "destination_ids": destination_ids,
-            "reply": reply,
+            "reply": reply or (
+                f"Calculating separate shortest paths from Building "
+                f"{origin_id} to Buildings {destination_ids}."
+            ),
         }
 
     if action == "route":
-        building_ids = [int(value) for value in result.get("building_ids", [])]
+        building_ids = [
+            int(value)
+            for value in result.get("building_ids", [])
+        ]
+
+        if len(building_ids) < 2:
+            raise ValueError(
+                "Gemini did not provide at least two buildings for routing."
+            )
+
         return {
             "action": "route",
             "building_ids": building_ids,
-            "reply": reply,
+            "reply": reply or (
+                f"Calculating the route through Buildings "
+                f"{building_ids} in the requested order."
+            ),
         }
 
     return {
         "action": "unknown",
-        "reply": reply or "I could not identify the requested GIS analysis.",
+        "reply": reply or (
+            "I could not identify the requested GIS analysis."
+        ),
     }
 
 
 def interpret_gis_command(
     question: str,
     api_key: str,
-    model_name: str = "gemini-2.5-flash",
+    model_name: str = "gemini-3.1-flash-lite",
 ) -> dict[str, Any]:
-    """Use Gemini to classify a natural-language GIS request."""
+    """
+    Use Gemini to classify a natural-language GIS request.
+
+    Supported actions:
+    - route
+    - multi_origin_route
+    - one_origin_multi_destination
+    - service_area
+    - unknown
+    """
 
     if not question or not question.strip():
-        raise ValueError("The GIS question cannot be empty.")
+        raise ValueError(
+            "The GIS question cannot be empty."
+        )
 
     if not api_key or not api_key.strip():
-        raise ValueError("A Gemini API key is required.")
+        raise ValueError(
+            "A Gemini API key is required."
+        )
 
     try:
         from google import genai
         from google.genai import types
     except ImportError as error:
         raise RuntimeError(
-            "The google-genai package is missing. Run: pip install google-genai"
+            "The google-genai package is missing. "
+            "Run: pip install google-genai"
         ) from error
 
     response_schema = {
@@ -138,19 +228,40 @@ def interpret_gis_command(
             },
             "building_ids": {
                 "type": "array",
-                "items": {"type": "integer"},
+                "items": {
+                    "type": "integer",
+                },
             },
             "origin_ids": {
                 "type": "array",
-                "items": {"type": "integer"},
+                "items": {
+                    "type": "integer",
+                },
             },
-            "destination_id": {"type": ["integer", "null"]},
-            "origin_id": {"type": ["integer", "null"]},
+            "destination_id": {
+                "type": [
+                    "integer",
+                    "null",
+                ],
+            },
+            "origin_id": {
+                "type": [
+                    "integer",
+                    "null",
+                ],
+            },
             "destination_ids": {
                 "type": "array",
-                "items": {"type": "integer"},
+                "items": {
+                    "type": "integer",
+                },
             },
-            "minutes": {"type": ["number", "null"]},
+            "minutes": {
+                "type": [
+                    "number",
+                    "null",
+                ],
+            },
             "travel_modes": {
                 "type": "array",
                 "items": {
@@ -163,64 +274,166 @@ def interpret_gis_command(
                     ],
                 },
             },
-            "reply": {"type": "string"},
+            "reply": {
+                "type": "string",
+            },
         },
-        "required": ["action", "reply"],
+        "required": [
+            "action",
+            "reply",
+        ],
     }
 
     system_instruction = """
-You are a GIS command interpreter for a university campus network-analysis app.
-Return only structured JSON that matches the supplied schema.
+You are a GIS command interpreter for a university campus
+network-analysis application.
 
-Choose exactly one action:
+Return only structured JSON matching the supplied schema.
+
+Choose exactly one action.
 
 1. route
-Use for one point to one point, or an ordered multi-stop journey.
-Preserve the order in building_ids.
-Example: "Start at Building 10, visit 20, then 35" -> [10, 20, 35].
+
+Use for:
+- one building to one building; or
+- an ordered multi-stop journey.
+
+Preserve the exact requested order in building_ids.
+
+Examples:
+"Find the shortest route from Building 10 to Building 20."
+building_ids = [10, 20]
+
+"Start at Building 10, visit Buildings 20 and 35,
+then go to Building 50."
+building_ids = [10, 20, 35, 50]
+
 
 2. multi_origin_route
-Use when several origins each require an independent shortest path to one
-common destination.
-Example: "Separate routes from Buildings 1, 2 and 3 to Building 444".
+
+Use when several origin buildings each require an independent
+shortest path to one common destination.
+
+Example:
+"Show separate routes from Buildings 1, 2 and 3
+to Building 444."
+
+origin_ids = [1, 2, 3]
+destination_id = 444
+
 
 3. one_origin_multi_destination
-Use when one origin requires independent shortest paths to several destinations.
-Example: "Separate routes from Building 10 to Buildings 20, 30 and 40".
+
+Use when one origin building requires independent shortest paths
+to several destination buildings.
+
+Example:
+"Show separate routes from Building 10
+to Buildings 20, 30 and 40."
+
+origin_id = 10
+destination_ids = [20, 30, 40]
+
 
 4. service_area
-Use for reachable-within-time or isochrone questions.
-Extract origin_id, minutes and all requested travel_modes.
+
+Use for:
+- reachable-within-time requests;
+- service-area requests;
+- isochrone requests; or
+- comparisons of accessibility by travel mode.
+
+Extract:
+- origin_id
+- minutes
+- every requested travel mode
+
+Allowed travel modes:
+- Walking
+- E-bike
+- Motorcycle
+- Car driving
+
 Examples:
-- "Show all buildings within 5 minutes walking from Building 10"
-- "Compare 5-minute walking, e-bike and car service areas from Building 10"
-- "What can I reach in 8 minutes by motorcycle from Building 25?"
-If no mode is stated for a service area, use Walking.
+"Show all buildings within 5 minutes walking
+from Building 10."
+
+origin_id = 10
+minutes = 5
+travel_modes = ["Walking"]
+
+"Compare 5-minute walking, e-bike and car-driving
+service areas from Building 10."
+
+origin_id = 10
+minutes = 5
+travel_modes = [
+    "Walking",
+    "E-bike",
+    "Car driving"
+]
+
+"What buildings can I reach within 8 minutes
+by motorcycle from Building 25?"
+
+origin_id = 25
+minutes = 8
+travel_modes = ["Motorcycle"]
+
+If the user requests a service area without naming a travel mode,
+use Walking.
+
 
 5. unknown
-Use when the request does not contain enough information.
 
-Do not calculate spatial results. Only classify the request and extract parameters.
+Use only when the request does not contain enough information
+to perform one of the supported GIS analyses.
+
+Do not perform spatial calculations.
+Do not invent building IDs, time limits, or travel modes.
+Only classify the request and extract its parameters.
 """.strip()
 
-    client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model_name,
-        contents=question,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            response_mime_type="application/json",
-            response_json_schema=response_schema,
-            temperature=0,
-        ),
+    client = genai.Client(
+        api_key=api_key.strip(),
     )
 
+    try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=question.strip(),
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                response_mime_type="application/json",
+                response_json_schema=response_schema,
+                temperature=0,
+            ),
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"Gemini request failed using model "
+            f"'{model_name}': {error}"
+        ) from error
+
     if not response.text:
-        raise ValueError("Gemini returned an empty response.")
+        raise ValueError(
+            "Gemini returned an empty response."
+        )
 
     try:
-        parsed = json.loads(response.text)
+        parsed = json.loads(
+            response.text
+        )
     except json.JSONDecodeError as error:
-        raise ValueError("Gemini did not return valid JSON.") from error
+        raise ValueError(
+            "Gemini did not return valid JSON."
+        ) from error
 
-    return _clean_result(parsed)
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            "Gemini returned JSON in an unexpected format."
+        )
+
+    return _clean_result(
+        parsed
+    )
