@@ -1,191 +1,226 @@
-import random
-import time
-from typing import Literal
+"""Gemini GIS command interpreter.
 
-from google import genai
-from google.genai import types
-from pydantic import BaseModel, Field
+Install:
+    pip install google-genai
 
-
-# ============================================================
-# STRUCTURED GIS COMMAND
-# ============================================================
-
-class GISCommand(BaseModel):
-    action: Literal["route", "unknown"] = Field(
-        description=(
-            "Use route when the user asks to travel, navigate, "
-            "walk, find a path, or calculate a route between "
-            "building FIDs. Otherwise use unknown."
-        )
-    )
-
-    building_ids: list[int] = Field(
-        description=(
-            "Building FIDs in the exact requested visiting order."
-        )
-    )
-
-    reply: str = Field(
-        description=(
-            "Briefly explain the interpreted request. "
-            "Do not calculate distance, walking time, or coordinates."
-        )
-    )
-
-
-SYSTEM_INSTRUCTION = """
-You are the natural-language interface for a campus GIS.
-
-The GIS currently supports shortest-path and multi-stop routing
-between building FIDs.
-
-Your only responsibilities are:
-1. Detect whether the user wants a route.
-2. Extract the building FIDs.
-3. Preserve their requested visiting order.
-4. Return structured JSON matching the supplied schema.
-
-Rules:
-- A building FID is an integer.
-- At least two FIDs are needed for a route.
-- Repeated FIDs are allowed for return journeys.
-- Do not calculate route distance.
-- Do not calculate walking time.
-- Do not invent coordinates.
-- The Python GIS engine performs the actual spatial analysis.
-
-Examples:
-
-User: Take me from Building 10 to Building 20
-Result:
-action = route
-building_ids = [10, 20]
-
-User: Start at 10, visit 20 and 35, then return to 10
-Result:
-action = route
-building_ids = [10, 20, 35, 10]
-
-User: What is the weather?
-Result:
-action = unknown
-building_ids = []
+The LLM only converts natural language into a structured GIS action.
+All spatial calculations remain in the Streamlit GIS application.
 """
 
+from __future__ import annotations
 
-# Try the lightweight model first.
-MODEL_LIST = [
-    "gemini-3.1-flash-lite",
-    "gemini-3.5-flash",
-]
+import json
+from typing import Any
 
 
-def _call_model(
-    client,
-    model_name: str,
-    prompt: str,
-) -> GISCommand:
-    response = client.models.generate_content(
-        model=model_name,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=GISCommand,
-        ),
-    )
+SUPPORTED_MODES = {
+    "walking": "Walking",
+    "walk": "Walking",
+    "pedestrian": "Walking",
+    "e-bike": "E-bike",
+    "ebike": "E-bike",
+    "e bike": "E-bike",
+    "bike": "E-bike",
+    "bicycle": "E-bike",
+    "motorcycle": "Motorcycle",
+    "motorbike": "Motorcycle",
+    "car": "Car driving",
+    "drive": "Car driving",
+    "driving": "Car driving",
+}
 
-    if not response.text:
-        raise RuntimeError(
-            f"{model_name} returned an empty response."
-        )
 
-    return GISCommand.model_validate_json(response.text)
+def _clean_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Validate and normalise Gemini's structured response."""
+
+    action = str(result.get("action", "unknown")).strip()
+    reply = str(result.get("reply", "")).strip()
+
+    if action == "service_area":
+        origin_id = int(result["origin_id"])
+        minutes = float(result["minutes"])
+
+        raw_modes = result.get("travel_modes") or ["Walking"]
+        modes: list[str] = []
+        for raw_mode in raw_modes:
+            mode_text = str(raw_mode).strip()
+            canonical = SUPPORTED_MODES.get(mode_text.lower(), mode_text)
+            if canonical in {"Walking", "E-bike", "Motorcycle", "Car driving"}:
+                if canonical not in modes:
+                    modes.append(canonical)
+
+        if not modes:
+            modes = ["Walking"]
+
+        if minutes <= 0:
+            raise ValueError("Service-area minutes must be greater than zero.")
+
+        return {
+            "action": "service_area",
+            "origin_id": origin_id,
+            "minutes": minutes,
+            "travel_modes": modes,
+            "reply": reply or (
+                f"Calculating a {minutes:g}-minute service area from "
+                f"Building {origin_id} for {', '.join(modes)}."
+            ),
+        }
+
+    if action == "multi_origin_route":
+        origin_ids = [int(value) for value in result.get("origin_ids", [])]
+        destination_id = int(result["destination_id"])
+        return {
+            "action": action,
+            "origin_ids": origin_ids,
+            "destination_id": destination_id,
+            "reply": reply,
+        }
+
+    if action == "one_origin_multi_destination":
+        origin_id = int(result["origin_id"])
+        destination_ids = [
+            int(value) for value in result.get("destination_ids", [])
+        ]
+        return {
+            "action": action,
+            "origin_id": origin_id,
+            "destination_ids": destination_ids,
+            "reply": reply,
+        }
+
+    if action == "route":
+        building_ids = [int(value) for value in result.get("building_ids", [])]
+        return {
+            "action": "route",
+            "building_ids": building_ids,
+            "reply": reply,
+        }
+
+    return {
+        "action": "unknown",
+        "reply": reply or "I could not identify the requested GIS analysis.",
+    }
 
 
 def interpret_gis_command(
     question: str,
     api_key: str,
-) -> dict:
-    """
-    Interpret natural language using Gemini.
+    model_name: str = "gemini-2.5-flash",
+) -> dict[str, Any]:
+    """Use Gemini to classify a natural-language GIS request."""
 
-    It tries multiple models and retries temporary server errors.
-    The GIS engine still performs all route calculations.
-    """
+    if not question or not question.strip():
+        raise ValueError("The GIS question cannot be empty.")
 
-    if not isinstance(question, str):
-        raise TypeError("The GIS request must be text.")
+    if not api_key or not api_key.strip():
+        raise ValueError("A Gemini API key is required.")
 
-    cleaned_question = question.strip()
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as error:
+        raise RuntimeError(
+            "The google-genai package is missing. Run: pip install google-genai"
+        ) from error
 
-    if not cleaned_question:
-        raise ValueError("Please enter a GIS request.")
+    response_schema = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "route",
+                    "multi_origin_route",
+                    "one_origin_multi_destination",
+                    "service_area",
+                    "unknown",
+                ],
+            },
+            "building_ids": {
+                "type": "array",
+                "items": {"type": "integer"},
+            },
+            "origin_ids": {
+                "type": "array",
+                "items": {"type": "integer"},
+            },
+            "destination_id": {"type": ["integer", "null"]},
+            "origin_id": {"type": ["integer", "null"]},
+            "destination_ids": {
+                "type": "array",
+                "items": {"type": "integer"},
+            },
+            "minutes": {"type": ["number", "null"]},
+            "travel_modes": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "Walking",
+                        "E-bike",
+                        "Motorcycle",
+                        "Car driving",
+                    ],
+                },
+            },
+            "reply": {"type": "string"},
+        },
+        "required": ["action", "reply"],
+    }
 
-    if not api_key or not str(api_key).strip():
-        raise ValueError("Gemini API key is missing.")
+    system_instruction = """
+You are a GIS command interpreter for a university campus network-analysis app.
+Return only structured JSON that matches the supplied schema.
 
-    client = genai.Client(
-        api_key=str(api_key).strip()
+Choose exactly one action:
+
+1. route
+Use for one point to one point, or an ordered multi-stop journey.
+Preserve the order in building_ids.
+Example: "Start at Building 10, visit 20, then 35" -> [10, 20, 35].
+
+2. multi_origin_route
+Use when several origins each require an independent shortest path to one
+common destination.
+Example: "Separate routes from Buildings 1, 2 and 3 to Building 444".
+
+3. one_origin_multi_destination
+Use when one origin requires independent shortest paths to several destinations.
+Example: "Separate routes from Building 10 to Buildings 20, 30 and 40".
+
+4. service_area
+Use for reachable-within-time or isochrone questions.
+Extract origin_id, minutes and all requested travel_modes.
+Examples:
+- "Show all buildings within 5 minutes walking from Building 10"
+- "Compare 5-minute walking, e-bike and car service areas from Building 10"
+- "What can I reach in 8 minutes by motorcycle from Building 25?"
+If no mode is stated for a service area, use Walking.
+
+5. unknown
+Use when the request does not contain enough information.
+
+Do not calculate spatial results. Only classify the request and extract parameters.
+""".strip()
+
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=model_name,
+        contents=question,
+        config=types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            response_mime_type="application/json",
+            response_json_schema=response_schema,
+            temperature=0,
+        ),
     )
 
-    prompt = f"""
-{SYSTEM_INSTRUCTION}
+    if not response.text:
+        raise ValueError("Gemini returned an empty response.")
 
-User request:
-{cleaned_question}
-"""
+    try:
+        parsed = json.loads(response.text)
+    except json.JSONDecodeError as error:
+        raise ValueError("Gemini did not return valid JSON.") from error
 
-    errors = []
-
-    # Each model gets up to three attempts.
-    for model_name in MODEL_LIST:
-        for attempt in range(3):
-            try:
-                command = _call_model(
-                    client=client,
-                    model_name=model_name,
-                    prompt=prompt,
-                )
-
-                command.building_ids = [
-                    int(building_id)
-                    for building_id in command.building_ids
-                ]
-
-                if (
-                    command.action == "route"
-                    and len(command.building_ids) < 2
-                ):
-                    command.action = "unknown"
-                    command.building_ids = []
-                    command.reply = (
-                        "Please provide at least two building FIDs."
-                    )
-
-                if command.action == "unknown":
-                    command.building_ids = []
-
-                result = command.model_dump()
-                result["model_used"] = model_name
-
-                return result
-
-            except Exception as error:
-                errors.append(
-                    f"{model_name}, attempt {attempt + 1}: "
-                    f"{error}"
-                )
-
-                # 1–2 sec, then 2–4 sec, then 4–8 sec.
-                if attempt < 2:
-                    delay = (2 ** attempt) + random.uniform(
-                        0.5,
-                        1.5,
-                    )
-                    time.sleep(delay)
-
-    raise RuntimeError(
-        "All Gemini models were temporarily unavailable. "
-        + " | ".join(errors)
-    )
+    return _clean_result(parsed)
