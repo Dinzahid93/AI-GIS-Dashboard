@@ -2035,6 +2035,33 @@ if submitted:
 
             interpreter_used = "Gemini"
 
+            # Compatibility safeguard: an older ai_engine.py may return
+            # action=unknown with a refusal for service-area requests.
+            # In that case, recover with the built-in parser instead of
+            # showing a false unsupported-analysis message.
+            if not isinstance(parsed, dict):
+                parsed = {"action": "unknown", "reply": ""}
+
+            if parsed.get("action") == "unknown":
+                fallback_parsed = parse_service_area_command(question)
+
+                if fallback_parsed is None:
+                    fallback_parsed = (
+                        parse_one_origin_multi_destination_command(question)
+                    )
+
+                if fallback_parsed is None:
+                    fallback_parsed = parse_multi_origin_command(question)
+
+                if fallback_parsed is None:
+                    fallback_parsed = parse_command(question)
+
+                if fallback_parsed.get("action") != "unknown":
+                    parsed = fallback_parsed
+                    interpreter_used = (
+                        "Built-in fallback after Gemini returned unknown"
+                    )
+
         except Exception as gemini_error:
             # ----------------------------------------------------
             # FALLBACK PARSERS
@@ -2288,9 +2315,9 @@ if submitted:
                 )
 
             st.warning(
-                "The request was not recognised as a route request. "
-                "Try: 'Find the shortest route from Building 10 "
-                "to Building 20'."
+                "The request was not recognised as a supported GIS request. "
+                "Try a shortest-path, multi-route or service-area example "
+                "shown above."
             )
 
 
