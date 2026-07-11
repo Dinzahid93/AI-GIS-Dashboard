@@ -29,7 +29,7 @@ from building_manager import (
 # ============================================================
 
 st.set_page_config(
-    page_title="AI GIS Dashboard",
+    page_title="LLM Powered UiTM Shah Alam Campus Map",
     page_icon="🗺️",
     layout="wide",
     initial_sidebar_state="expanded",
