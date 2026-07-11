@@ -1941,6 +1941,11 @@ st.caption(
     "Manual tools remain available below in collapsible panels."
 )
 
+st.metric(
+    "Buildings",
+    f"{len(buildings_wgs):,}",
+)
+
 
 # ============================================================
 # 17. GEMINI AI GIS ASSISTANT
@@ -1958,7 +1963,7 @@ with st.form(
     clear_on_submit=False,
 ):
     question = st.text_input(
-        "Enter a your query request",
+        "Enter your GIS request",
         value=st.session_state.last_question,
         placeholder=(
             "Example: Find the shortest route from Building 10 "
@@ -1966,35 +1971,69 @@ with st.form(
         ),
     )
 
-    st.markdown(
-        """
-        **Sample wording**
+    with st.expander(
+        "📖 Example GIS commands",
+        expanded=False,
+    ):
+        st.markdown(
+            """
+            **One point → one point**  
+            `Find the shortest route from Building 10 to Building 20.`
 
-        • **One point → one point:**  
-        `Find the shortest route from Building 10 to Building 20.`
+            **Ordered multi-stop route**  
+            `Start at Building 10, visit Buildings 20 and 35, then go to Building 50.`
 
-        • **Ordered multi-stop route:**  
-        `Start at Building 10, visit Buildings 20 and 35, then go to Building 50.`
+            **Multiple Origins → One Destination**  
+            `Show separate shortest paths from Buildings 1, 2, 3 and 4 to Building 444.`
 
-        • **Multiple Origins → One Destination:**  
-        `Show separate shortest paths from Buildings 1, 2, 3 and 4 to Building 444.`
+            **One Origin → Multiple Destinations**  
+            `Show separate shortest paths from Building 10 to Buildings 20, 30 and 40.`
 
-        • **One Origin → Multiple Destinations:**  
-        `Show separate shortest paths from Building 10 to Buildings 20, 30 and 40.`
+            **Service Area — one mode**  
+            `Show every building reachable within 5 minutes walking from Building 10.`
+
+            **Service Area — compare modes**  
+            `Compare 5-minute walking, e-bike and car driving service areas from Building 10.`
+            """
+        )
+
+    run_col, clear_col = st.columns([3, 1])
+
+    with run_col:
+        submitted = st.form_submit_button(
+            "▶ Run AI GIS Analysis",
+            type="primary",
+            use_container_width=True,
+        )
+
+    with clear_col:
+        clear_pressed = st.form_submit_button(
+            "🗑️ Clear",
+            use_container_width=True,
+        )
 
 
-        • **Service Area — one mode:**  
-        `Show every building reachable within 5 minutes walking from Building 10.`
+if clear_pressed:
+    st.session_state.route_result = None
+    st.session_state.route_legs = None
+    st.session_state.total_distance = None
+    st.session_state.selected_building_ids = None
 
-        • **Service Area — compare modes:**  
-        `Compare 5-minute walking, e-bike and car driving service areas from Building 10.`
-        """
-    )
+    st.session_state.multi_route_results = None
+    st.session_state.multi_route_table = None
+    st.session_state.multi_route_destination = None
+    st.session_state.independent_route_mode = None
 
-    submitted = st.form_submit_button(
-        "Run AI GIS command",
-        type="primary",
-    )
+    st.session_state.service_area_results = None
+    st.session_state.service_area_table = None
+    st.session_state.service_area_origin = None
+    st.session_state.service_area_minutes = None
+
+    st.session_state.last_question = ""
+    st.session_state.last_ai_reply = ""
+    st.session_state.last_interpreter = ""
+
+    st.rerun()
 
 
 if submitted:
@@ -2883,33 +2922,6 @@ with st.expander("⏱️ Service Area (Isochrone)", expanded=False):
 
         except Exception as error:
             st.error(f"Unable to calculate service area: {error}")
-
-# ============================================================
-# 15. CLEAR ROUTE
-# ============================================================
-
-if (
-    st.session_state.route_result is not None
-    or st.session_state.multi_route_results is not None
-    or st.session_state.service_area_results is not None
-):
-    if st.button("Clear route"):
-        st.session_state.route_result = None
-        st.session_state.route_legs = None
-        st.session_state.total_distance = None
-        st.session_state.selected_building_ids = None
-        st.session_state.last_question = ""
-        st.session_state.last_ai_reply = ""
-        st.session_state.last_interpreter = ""
-        st.session_state.multi_route_results = None
-        st.session_state.multi_route_table = None
-        st.session_state.multi_route_destination = None
-        st.session_state.independent_route_mode = None
-        st.session_state.service_area_results = None
-        st.session_state.service_area_table = None
-        st.session_state.service_area_origin = None
-        st.session_state.service_area_minutes = None
-        st.rerun()
 
 
 # ============================================================
