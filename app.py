@@ -2006,37 +2006,18 @@ if submitted:
     st.session_state.last_question = question
 
     if not question.strip():
-        st.warning("Please enter a route request.")
+        st.warning("Please enter a GIS request.")
 
     else:
-        parsed = parse_service_area_command(
-            question
-        )
+        parsed = None
+        interpreter_used = ""
 
-        if parsed:
-            interpreter_used = "Built-in service-area parser"
-        else:
-            parsed = parse_one_origin_multi_destination_command(
-                question
-            )
-
-            if parsed:
-                interpreter_used = (
-                    "Built-in one-origin/multiple-destination parser"
-                )
-            else:
-                parsed = parse_multi_origin_command(
-                    question
-                )
-                interpreter_used = (
-                    "Built-in multiple-origin parser"
-                    if parsed else ""
-                )
-
-        # Use Gemini when the request is not an explicit multi-origin command.
+        # --------------------------------------------------------
+        # AI-FIRST INTERPRETATION
+        # Gemini always receives the request first. The built-in
+        # parsers are used only when Gemini is unavailable or fails.
+        # --------------------------------------------------------
         try:
-            if parsed is not None:
-                raise RuntimeError("MULTI_ORIGIN_ALREADY_PARSED")
             gemini_key = str(
                 st.secrets.get("GEMINI_API_KEY", "")
             ).strip()
@@ -2046,7 +2027,7 @@ if submitted:
                     "GEMINI_API_KEY is missing from Streamlit Secrets."
                 )
 
-            with st.spinner("Gemini is interpreting your request..."):
+            with st.spinner("Gemini is interpreting your GIS request..."):
                 parsed = interpret_gis_command(
                     question=question,
                     api_key=gemini_key,
@@ -2055,15 +2036,46 @@ if submitted:
             interpreter_used = "Gemini"
 
         except Exception as gemini_error:
-            if str(gemini_error) != "MULTI_ORIGIN_ALREADY_PARSED":
-                # Safe fallback: the older number-and-keyword parser.
-                parsed = parse_command(question)
-                interpreter_used = "Rule-based fallback"
+            # ----------------------------------------------------
+            # FALLBACK PARSERS
+            # These keep the dashboard usable if Gemini is offline,
+            # quota-limited, misconfigured or temporarily unavailable.
+            # ----------------------------------------------------
+            parsed = parse_service_area_command(question)
 
-                st.warning(
-                    "Gemini was unavailable, so the app used the "
-                    f"rule-based fallback. Details: {gemini_error}"
+            if parsed is not None:
+                interpreter_used = "Built-in service-area fallback"
+            else:
+                parsed = parse_one_origin_multi_destination_command(
+                    question
                 )
+
+                if parsed is not None:
+                    interpreter_used = (
+                        "Built-in one-origin/multiple-destination fallback"
+                    )
+                else:
+                    parsed = parse_multi_origin_command(question)
+
+                    if parsed is not None:
+                        interpreter_used = (
+                            "Built-in multiple-origin fallback"
+                        )
+                    else:
+                        parsed = parse_command(question)
+                        interpreter_used = "Rule-based route fallback"
+
+            st.warning(
+                "Gemini could not interpret the request, so the dashboard "
+                "used its built-in fallback parser. "
+                f"Details: {gemini_error}"
+            )
+
+        if parsed is None:
+            parsed = {
+                "action": "unknown",
+                "reply": "The GIS request could not be interpreted.",
+            }
 
         st.session_state.last_interpreter = interpreter_used
         st.session_state.last_ai_reply = str(
