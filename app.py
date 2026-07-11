@@ -1937,8 +1937,8 @@ def create_map(
 st.title("🗺️ AI GIS Dashboard")
 
 st.caption(
-    "Natural-language campus routing using UAV orthomosaic, "
-    "building footprints and road-network analysis."
+    "Ask the AI GIS Assistant to run routing and service-area analyses. "
+    "Manual tools remain available below in collapsible panels."
 )
 
 st.metric(
@@ -1948,574 +1948,14 @@ st.metric(
 
 
 # ============================================================
-# 12. BUILDING NAME EDITOR
-# ============================================================
-
-with st.expander("🏢 Admin Building Name Editor", expanded=False):
-    admin_password = st.text_input(
-        "Admin password",
-        type="password",
-        key="admin_password_input",
-    )
-
-    if admin_password:
-        expected_password = str(
-            st.secrets.get("ADMIN_PASSWORD", "")
-        )
-
-        if admin_password != expected_password:
-            st.error("Incorrect admin password.")
-        else:
-            st.success("Admin access enabled.")
-
-            editor_buildings = buildings.sort_values("FID").copy()
-            editor_options = {
-                building_display_label(row): int(row["FID"])
-                for _, row in editor_buildings.iterrows()
-            }
-
-            selected_editor_label = st.selectbox(
-                "Select building",
-                options=list(editor_options.keys()),
-                key="building_editor_select",
-            )
-
-            selected_editor_fid = editor_options[
-                selected_editor_label
-            ]
-
-            selected_record = buildings[
-                buildings["FID"] == selected_editor_fid
-            ].iloc[0]
-
-            current_name = str(
-                selected_record.get("NAME", "")
-            ).strip()
-
-            st.write(f"**Building FID:** {selected_editor_fid}")
-            st.write(
-                "**Current name:** "
-                + (current_name if current_name else "Unnamed")
-            )
-
-            # ----------------------------------------------------
-            # Selected-building preview map
-            # ----------------------------------------------------
-            st.markdown("#### Selected building preview")
-            st.caption(
-                "Change the FID above and this map will zoom to the "
-                "selected building so you can identify it before naming it."
-            )
-
-            preview_selected_wgs = buildings_wgs[
-                buildings_wgs["FID"] == selected_editor_fid
-            ].copy()
-
-            preview_selected_m = buildings_m[
-                buildings_m["FID"] == selected_editor_fid
-            ].copy()
-
-            if not preview_selected_wgs.empty:
-                preview_point_m = (
-                    preview_selected_m.geometry
-                    .representative_point()
-                    .iloc[0]
-                )
-
-                preview_point_wgs = (
-                    gpd.GeoSeries(
-                        [preview_point_m],
-                        crs=PROJECTED_CRS,
-                    )
-                    .to_crs(WEB_CRS)
-                    .iloc[0]
-                )
-
-                preview_map = folium.Map(
-                    location=[
-                        preview_point_wgs.y,
-                        preview_point_wgs.x,
-                    ],
-                    zoom_start=20,
-                    tiles=None,
-                    max_zoom=23,
-                    control_scale=True,
-                )
-
-                # OpenStreetMap base
-                folium.TileLayer(
-                    tiles="OpenStreetMap",
-                    name="OpenStreetMap",
-                    overlay=False,
-                    control=True,
-                    show=True,
-                    max_zoom=23,
-                ).add_to(preview_map)
-
-                # Transparent UAV orthomosaic overlay
-                preview_ortho = TransparentWhiteTileLayer(
-                    tile_url=ORTHO_TILE_URL,
-                    white_threshold=245,
-                    opacity=1.0,
-                    max_native_zoom=20,
-                    max_zoom=23,
-                )
-                preview_ortho.add_to(preview_map)
-
-                # Nearby roads for orientation
-                folium.GeoJson(
-                    roads_wgs,
-                    name="Road Network",
-                    style_function=lambda feature: {
-                        "color": ROAD_COLOUR,
-                        "weight": 2.5,
-                        "opacity": 0.75,
-                    },
-                ).add_to(preview_map)
-
-                # All buildings remain orange
-                folium.GeoJson(
-                    buildings_wgs,
-                    name="Building Footprints",
-                    style_function=lambda feature: {
-                        "color": BUILDING_COLOUR,
-                        "weight": 1.0,
-                        "fillColor": BUILDING_COLOUR,
-                        "fillOpacity": 0.18,
-                    },
-                    tooltip=folium.GeoJsonTooltip(
-                        fields=["FID", "NAME"],
-                        aliases=["Building ID:", "Building Name:"],
-                        sticky=True,
-                    ),
-                ).add_to(preview_map)
-
-                # Selected building is highlighted in green
-                folium.GeoJson(
-                    preview_selected_wgs,
-                    name=f"Selected Building {selected_editor_fid}",
-                    style_function=lambda feature: {
-                        "color": START_COLOUR,
-                        "weight": 4,
-                        "fillColor": START_COLOUR,
-                        "fillOpacity": 0.72,
-                    },
-                    tooltip=folium.Tooltip(
-                        f"Selected Building FID: {selected_editor_fid}<br>"
-                        f"Current name: "
-                        f"{current_name if current_name else 'Unnamed'}",
-                        sticky=True,
-                    ),
-                ).add_to(preview_map)
-
-                folium.Marker(
-                    location=[
-                        preview_point_wgs.y,
-                        preview_point_wgs.x,
-                    ],
-                    tooltip=f"Building FID {selected_editor_fid}",
-                    popup=(
-                        f"<b>Building FID:</b> {selected_editor_fid}<br>"
-                        f"<b>Current name:</b> "
-                        f"{current_name if current_name else 'Unnamed'}"
-                    ),
-                ).add_to(preview_map)
-
-                folium.LayerControl(
-                    collapsed=True,
-                    position="topright",
-                ).add_to(preview_map)
-
-                st_folium(
-                    preview_map,
-                    width=None,
-                    height=430,
-                    returned_objects=[],
-                    use_container_width=True,
-                    key=f"building_preview_map_{selected_editor_fid}",
-                )
-            else:
-                st.warning(
-                    f"Building FID {selected_editor_fid} could not be displayed."
-                )
-
-            new_name = st.text_input(
-                "New building name",
-                value=current_name,
-                key=f"new_building_name_{selected_editor_fid}",
-            )
-
-            if st.button(
-                "Save building name",
-                type="primary",
-                key="save_building_name_button",
-            ):
-                try:
-                    updated_buildings = update_building_name_locally(
-                        buildings=buildings,
-                        building_fid=selected_editor_fid,
-                        new_name=new_name,
-                    )
-
-                    save_building_names_to_github(
-                        buildings=updated_buildings,
-                        streamlit_secrets=st.secrets,
-                        building_fid=selected_editor_fid,
-                        new_name=new_name,
-                    )
-
-                    st.success(
-                        f"Saved '{new_name}' for Building "
-                        f"{selected_editor_fid}."
-                    )
-                    st.info(
-                        "GitHub has been updated. The app will "
-                        "redeploy automatically."
-                    )
-                    st.cache_data.clear()
-
-                except Exception as error:
-                    st.error(
-                        f"Unable to save building name: {error}"
-                    )
-
-
-# ============================================================
-# 13. SEARCHABLE BUILDING ROUTE PLANNER
-# ============================================================
-
-st.subheader("Building Route Planner")
-
-route_buildings = buildings.copy()
-route_buildings["display_label"] = route_buildings.apply(
-    building_display_label,
-    axis=1,
-)
-route_buildings = route_buildings.sort_values(
-    ["NAME", "FID"],
-    na_position="last",
-)
-
-building_label_to_fid = dict(
-    zip(
-        route_buildings["display_label"],
-        route_buildings["FID"].astype(int),
-    )
-)
-building_labels = list(building_label_to_fid.keys())
-
-route_col1, route_col2 = st.columns(2)
-
-with route_col1:
-    start_label = st.selectbox(
-        "Start building",
-        options=building_labels,
-        key="start_building_select",
-    )
-
-with route_col2:
-    destination_label = st.selectbox(
-        "Destination building",
-        options=building_labels,
-        index=1 if len(building_labels) > 1 else 0,
-        key="destination_building_select",
-    )
-
-selected_stop_labels = st.multiselect(
-    "Optional intermediate stops",
-    options=building_labels,
-    key="intermediate_stop_select",
-)
-
-if st.button(
-    "Calculate route from selected buildings",
-    type="primary",
-    key="calculate_named_route_button",
-):
-    try:
-        route_ids = [building_label_to_fid[start_label]]
-        route_ids.extend(
-            building_label_to_fid[label]
-            for label in selected_stop_labels
-        )
-        route_ids.append(
-            building_label_to_fid[destination_label]
-        )
-
-        if route_ids[0] == route_ids[-1] and len(route_ids) == 2:
-            raise ValueError(
-                "Start and destination must be different."
-            )
-
-        with st.spinner("Calculating shortest route..."):
-            route_result, route_legs, total_distance = (
-                calculate_multi_stop_route(route_ids)
-            )
-
-        st.session_state.route_result = route_result
-        st.session_state.route_legs = route_legs
-        st.session_state.total_distance = total_distance
-        st.session_state.selected_building_ids = route_ids
-        st.session_state.multi_route_results = None
-        st.session_state.multi_route_table = None
-        st.session_state.multi_route_destination = None
-        st.session_state.independent_route_mode = None
-        st.session_state.service_area_results = None
-        st.session_state.service_area_table = None
-        st.session_state.service_area_origin = None
-        st.session_state.service_area_minutes = None
-        st.success("Route calculated successfully.")
-
-    except Exception as error:
-        st.error(f"Unable to calculate route: {error}")
-
-
-# ============================================================
-# 14. MULTIPLE ORIGINS TO ONE DESTINATION
-# ============================================================
-
-st.subheader("Multiple Origins → One Destination")
-
-st.caption(
-    "Calculate a separate shortest path from every selected origin "
-    "to the same destination. Example: 1 → 444, 2 → 444, "
-    "3 → 444 and 4 → 444."
-)
-
-multi_col1, multi_col2 = st.columns([2, 1])
-
-with multi_col1:
-    multi_origin_labels = st.multiselect(
-        "Origin buildings",
-        options=building_labels,
-        key="multi_origin_buildings_select",
-    )
-
-with multi_col2:
-    multi_destination_label = st.selectbox(
-        "Common destination",
-        options=building_labels,
-        key="multi_destination_building_select",
-    )
-
-if st.button(
-    "Calculate separate routes to destination",
-    type="primary",
-    key="calculate_multi_origin_routes_button",
-):
-    try:
-        origin_ids = [building_label_to_fid[label] for label in multi_origin_labels]
-        destination_id = building_label_to_fid[multi_destination_label]
-
-        with st.spinner("Calculating separate shortest paths..."):
-            multi_results, multi_table = (
-                calculate_routes_from_origins_to_destination(
-                    origin_ids=origin_ids,
-                    destination_id=destination_id,
-                )
-            )
-
-        st.session_state.multi_route_results = multi_results
-        st.session_state.multi_route_table = multi_table
-        st.session_state.multi_route_destination = destination_id
-        st.session_state.independent_route_mode = "multiple_origins_one_destination"
-
-        # Clear the previous single/ordered route so the modes do not overlap.
-        st.session_state.route_result = None
-        st.session_state.route_legs = None
-        st.session_state.total_distance = None
-        st.session_state.selected_building_ids = None
-        st.session_state.service_area_results = None
-        st.session_state.service_area_table = None
-        st.session_state.service_area_origin = None
-        st.session_state.service_area_minutes = None
-
-        st.success(
-            f"Calculated {len(multi_results)} separate shortest paths "
-            f"to Building {destination_id}."
-        )
-
-    except Exception as error:
-        st.error(f"Unable to calculate the separate routes: {error}")
-
-
-
-# ============================================================
-# 15. ONE ORIGIN TO MULTIPLE DESTINATIONS
-# ============================================================
-
-st.subheader("One Origin → Multiple Destinations")
-
-st.caption(
-    "Calculate a separate shortest path from one origin to every "
-    "selected destination. Example: 10 → 20, 10 → 30 and 10 → 40."
-)
-
-one_many_col1, one_many_col2 = st.columns([1, 2])
-
-with one_many_col1:
-    one_origin_label = st.selectbox(
-        "Common origin",
-        options=building_labels,
-        key="one_origin_building_select",
-    )
-
-with one_many_col2:
-    multiple_destination_labels = st.multiselect(
-        "Destination buildings",
-        options=building_labels,
-        key="multiple_destination_buildings_select",
-    )
-
-if st.button(
-    "Calculate separate routes from origin",
-    type="primary",
-    key="calculate_one_origin_routes_button",
-):
-    try:
-        origin_id = building_label_to_fid[
-            one_origin_label
-        ]
-
-        destination_ids = [
-            building_label_to_fid[label]
-            for label in multiple_destination_labels
-        ]
-
-        with st.spinner(
-            "Calculating separate shortest paths..."
-        ):
-            multi_results, multi_table = (
-                calculate_routes_from_origin_to_destinations(
-                    origin_id=origin_id,
-                    destination_ids=destination_ids,
-                )
-            )
-
-        st.session_state.multi_route_results = multi_results
-        st.session_state.multi_route_table = multi_table
-        st.session_state.multi_route_destination = None
-        st.session_state.independent_route_mode = (
-            "one_origin_multiple_destinations"
-        )
-
-        st.session_state.route_result = None
-        st.session_state.route_legs = None
-        st.session_state.total_distance = None
-        st.session_state.selected_building_ids = None
-        st.session_state.service_area_results = None
-        st.session_state.service_area_table = None
-        st.session_state.service_area_origin = None
-        st.session_state.service_area_minutes = None
-
-        st.success(
-            f"Calculated {len(multi_results)} separate shortest paths "
-            f"from Building {origin_id}."
-        )
-
-    except Exception as error:
-        st.error(
-            f"Unable to calculate the separate routes: {error}"
-        )
-
-
-# ============================================================
-# 16. SERVICE AREA / ISOCHRONE ANALYSIS
-# ============================================================
-
-st.subheader("Service Area (Isochrone)")
-
-st.caption(
-    "Select one starting building, a time limit and one or more travel "
-    "modes. The GIS engine highlights the road network and buildings "
-    "reachable within that time. Each travel mode uses its own assumed "
-    "average speed."
-)
-
-service_col1, service_col2, service_col3 = st.columns([2, 1, 2])
-
-with service_col1:
-    service_origin_label = st.selectbox(
-        "Starting building",
-        options=building_labels,
-        key="service_area_origin_select",
-    )
-
-with service_col2:
-    service_minutes = st.number_input(
-        "Travel-time limit (minutes)",
-        min_value=1.0,
-        max_value=120.0,
-        value=5.0,
-        step=1.0,
-        key="service_area_minutes_input",
-    )
-
-with service_col3:
-    service_modes = st.multiselect(
-        "Travel modes",
-        options=list(TRAVEL_SPEEDS_KMH.keys()),
-        default=["Walking"],
-        key="service_area_modes_select",
-    )
-
-st.caption(
-    "Example comparison: select Walking, E-bike and Car driving with "
-    "a 5-minute limit to compare how many buildings are reachable."
-)
-
-if st.button(
-    "Calculate service area",
-    type="primary",
-    key="calculate_service_area_button",
-):
-    try:
-        service_origin_id = building_label_to_fid[
-            service_origin_label
-        ]
-
-        with st.spinner(
-            "Calculating network service areas and reachable buildings..."
-        ):
-            service_results, service_table = calculate_service_areas(
-                origin_id=service_origin_id,
-                minutes=service_minutes,
-                travel_modes=service_modes,
-            )
-
-        st.session_state.service_area_results = service_results
-        st.session_state.service_area_table = service_table
-        st.session_state.service_area_origin = service_origin_id
-        st.session_state.service_area_minutes = float(service_minutes)
-
-        # Clear route outputs so different analyses do not overlap.
-        st.session_state.route_result = None
-        st.session_state.route_legs = None
-        st.session_state.total_distance = None
-        st.session_state.selected_building_ids = None
-        st.session_state.multi_route_results = None
-        st.session_state.multi_route_table = None
-        st.session_state.multi_route_destination = None
-        st.session_state.independent_route_mode = None
-
-        st.success(
-            f"Calculated {len(service_results)} service area(s) "
-            f"from Building {service_origin_id}."
-        )
-
-    except Exception as error:
-        st.error(f"Unable to calculate service area: {error}")
-
-
-# ============================================================
 # 17. GEMINI AI GIS ASSISTANT
 # ============================================================
 
-st.subheader("AI GIS Assistant")
+st.subheader("🤖 AI GIS Assistant")
 
 st.caption(
-    "Gemini interprets your request and extracts the building FIDs. "
-    "The GIS engine performs the actual shortest-path analysis."
+    "Enter a natural-language GIS request below. Gemini interprets the "
+    "request, while the GIS engine performs routing or service-area analysis."
 )
 
 with st.form(
@@ -2523,7 +1963,7 @@ with st.form(
     clear_on_submit=False,
 ):
     question = st.text_input(
-        "Enter a route request",
+        "Enter a GIS request",
         value=st.session_state.last_question,
         placeholder=(
             "Example: Find the shortest route from Building 10 "
@@ -2848,6 +2288,567 @@ if st.session_state.last_interpreter:
         f"{st.session_state.last_interpreter}"
     )
 
+
+
+# ============================================================
+# COLLAPSIBLE MANUAL GIS TOOLS
+# ============================================================
+
+st.markdown("### Manual GIS Tools")
+st.caption(
+    "Open only the tool you need. Click the arrow again to collapse it."
+)
+
+# ============================================================
+# 12. BUILDING NAME EDITOR
+# ============================================================
+
+with st.expander("🏢 Admin Building Name Editor", expanded=False):
+    admin_password = st.text_input(
+        "Admin password",
+        type="password",
+        key="admin_password_input",
+    )
+
+    if admin_password:
+        expected_password = str(
+            st.secrets.get("ADMIN_PASSWORD", "")
+        )
+
+        if admin_password != expected_password:
+            st.error("Incorrect admin password.")
+        else:
+            st.success("Admin access enabled.")
+
+            editor_buildings = buildings.sort_values("FID").copy()
+            editor_options = {
+                building_display_label(row): int(row["FID"])
+                for _, row in editor_buildings.iterrows()
+            }
+
+            selected_editor_label = st.selectbox(
+                "Select building",
+                options=list(editor_options.keys()),
+                key="building_editor_select",
+            )
+
+            selected_editor_fid = editor_options[
+                selected_editor_label
+            ]
+
+            selected_record = buildings[
+                buildings["FID"] == selected_editor_fid
+            ].iloc[0]
+
+            current_name = str(
+                selected_record.get("NAME", "")
+            ).strip()
+
+            st.write(f"**Building FID:** {selected_editor_fid}")
+            st.write(
+                "**Current name:** "
+                + (current_name if current_name else "Unnamed")
+            )
+
+            # ----------------------------------------------------
+            # Selected-building preview map
+            # ----------------------------------------------------
+            st.markdown("#### Selected building preview")
+            st.caption(
+                "Change the FID above and this map will zoom to the "
+                "selected building so you can identify it before naming it."
+            )
+
+            preview_selected_wgs = buildings_wgs[
+                buildings_wgs["FID"] == selected_editor_fid
+            ].copy()
+
+            preview_selected_m = buildings_m[
+                buildings_m["FID"] == selected_editor_fid
+            ].copy()
+
+            if not preview_selected_wgs.empty:
+                preview_point_m = (
+                    preview_selected_m.geometry
+                    .representative_point()
+                    .iloc[0]
+                )
+
+                preview_point_wgs = (
+                    gpd.GeoSeries(
+                        [preview_point_m],
+                        crs=PROJECTED_CRS,
+                    )
+                    .to_crs(WEB_CRS)
+                    .iloc[0]
+                )
+
+                preview_map = folium.Map(
+                    location=[
+                        preview_point_wgs.y,
+                        preview_point_wgs.x,
+                    ],
+                    zoom_start=20,
+                    tiles=None,
+                    max_zoom=23,
+                    control_scale=True,
+                )
+
+                # OpenStreetMap base
+                folium.TileLayer(
+                    tiles="OpenStreetMap",
+                    name="OpenStreetMap",
+                    overlay=False,
+                    control=True,
+                    show=True,
+                    max_zoom=23,
+                ).add_to(preview_map)
+
+                # Transparent UAV orthomosaic overlay
+                preview_ortho = TransparentWhiteTileLayer(
+                    tile_url=ORTHO_TILE_URL,
+                    white_threshold=245,
+                    opacity=1.0,
+                    max_native_zoom=20,
+                    max_zoom=23,
+                )
+                preview_ortho.add_to(preview_map)
+
+                # Nearby roads for orientation
+                folium.GeoJson(
+                    roads_wgs,
+                    name="Road Network",
+                    style_function=lambda feature: {
+                        "color": ROAD_COLOUR,
+                        "weight": 2.5,
+                        "opacity": 0.75,
+                    },
+                ).add_to(preview_map)
+
+                # All buildings remain orange
+                folium.GeoJson(
+                    buildings_wgs,
+                    name="Building Footprints",
+                    style_function=lambda feature: {
+                        "color": BUILDING_COLOUR,
+                        "weight": 1.0,
+                        "fillColor": BUILDING_COLOUR,
+                        "fillOpacity": 0.18,
+                    },
+                    tooltip=folium.GeoJsonTooltip(
+                        fields=["FID", "NAME"],
+                        aliases=["Building ID:", "Building Name:"],
+                        sticky=True,
+                    ),
+                ).add_to(preview_map)
+
+                # Selected building is highlighted in green
+                folium.GeoJson(
+                    preview_selected_wgs,
+                    name=f"Selected Building {selected_editor_fid}",
+                    style_function=lambda feature: {
+                        "color": START_COLOUR,
+                        "weight": 4,
+                        "fillColor": START_COLOUR,
+                        "fillOpacity": 0.72,
+                    },
+                    tooltip=folium.Tooltip(
+                        f"Selected Building FID: {selected_editor_fid}<br>"
+                        f"Current name: "
+                        f"{current_name if current_name else 'Unnamed'}",
+                        sticky=True,
+                    ),
+                ).add_to(preview_map)
+
+                folium.Marker(
+                    location=[
+                        preview_point_wgs.y,
+                        preview_point_wgs.x,
+                    ],
+                    tooltip=f"Building FID {selected_editor_fid}",
+                    popup=(
+                        f"<b>Building FID:</b> {selected_editor_fid}<br>"
+                        f"<b>Current name:</b> "
+                        f"{current_name if current_name else 'Unnamed'}"
+                    ),
+                ).add_to(preview_map)
+
+                folium.LayerControl(
+                    collapsed=True,
+                    position="topright",
+                ).add_to(preview_map)
+
+                st_folium(
+                    preview_map,
+                    width=None,
+                    height=430,
+                    returned_objects=[],
+                    use_container_width=True,
+                    key=f"building_preview_map_{selected_editor_fid}",
+                )
+            else:
+                st.warning(
+                    f"Building FID {selected_editor_fid} could not be displayed."
+                )
+
+            new_name = st.text_input(
+                "New building name",
+                value=current_name,
+                key=f"new_building_name_{selected_editor_fid}",
+            )
+
+            if st.button(
+                "Save building name",
+                type="primary",
+                key="save_building_name_button",
+            ):
+                try:
+                    updated_buildings = update_building_name_locally(
+                        buildings=buildings,
+                        building_fid=selected_editor_fid,
+                        new_name=new_name,
+                    )
+
+                    save_building_names_to_github(
+                        buildings=updated_buildings,
+                        streamlit_secrets=st.secrets,
+                        building_fid=selected_editor_fid,
+                        new_name=new_name,
+                    )
+
+                    st.success(
+                        f"Saved '{new_name}' for Building "
+                        f"{selected_editor_fid}."
+                    )
+                    st.info(
+                        "GitHub has been updated. The app will "
+                        "redeploy automatically."
+                    )
+                    st.cache_data.clear()
+
+                except Exception as error:
+                    st.error(
+                        f"Unable to save building name: {error}"
+                    )
+
+
+# ============================================================
+# COLLAPSIBLE: 🧭 Manual Building Route Planner
+# ============================================================
+
+with st.expander("🧭 Manual Building Route Planner", expanded=False):
+    route_buildings = buildings.copy()
+    route_buildings["display_label"] = route_buildings.apply(
+        building_display_label,
+        axis=1,
+    )
+    route_buildings = route_buildings.sort_values(
+        ["NAME", "FID"],
+        na_position="last",
+    )
+
+    building_label_to_fid = dict(
+        zip(
+            route_buildings["display_label"],
+            route_buildings["FID"].astype(int),
+        )
+    )
+    building_labels = list(building_label_to_fid.keys())
+
+    route_col1, route_col2 = st.columns(2)
+
+    with route_col1:
+        start_label = st.selectbox(
+            "Start building",
+            options=building_labels,
+            key="start_building_select",
+        )
+
+    with route_col2:
+        destination_label = st.selectbox(
+            "Destination building",
+            options=building_labels,
+            index=1 if len(building_labels) > 1 else 0,
+            key="destination_building_select",
+        )
+
+    selected_stop_labels = st.multiselect(
+        "Optional intermediate stops",
+        options=building_labels,
+        key="intermediate_stop_select",
+    )
+
+    if st.button(
+        "Calculate route from selected buildings",
+        type="primary",
+        key="calculate_named_route_button",
+    ):
+        try:
+            route_ids = [building_label_to_fid[start_label]]
+            route_ids.extend(
+                building_label_to_fid[label]
+                for label in selected_stop_labels
+            )
+            route_ids.append(
+                building_label_to_fid[destination_label]
+            )
+
+            if route_ids[0] == route_ids[-1] and len(route_ids) == 2:
+                raise ValueError(
+                    "Start and destination must be different."
+                )
+
+            with st.spinner("Calculating shortest route..."):
+                route_result, route_legs, total_distance = (
+                    calculate_multi_stop_route(route_ids)
+                )
+
+            st.session_state.route_result = route_result
+            st.session_state.route_legs = route_legs
+            st.session_state.total_distance = total_distance
+            st.session_state.selected_building_ids = route_ids
+            st.session_state.multi_route_results = None
+            st.session_state.multi_route_table = None
+            st.session_state.multi_route_destination = None
+            st.session_state.independent_route_mode = None
+            st.session_state.service_area_results = None
+            st.session_state.service_area_table = None
+            st.session_state.service_area_origin = None
+            st.session_state.service_area_minutes = None
+            st.success("Route calculated successfully.")
+
+        except Exception as error:
+            st.error(f"Unable to calculate route: {error}")
+
+# ============================================================
+# COLLAPSIBLE: 🔀 Multiple Origins → One Destination
+# ============================================================
+
+with st.expander("🔀 Multiple Origins → One Destination", expanded=False):
+    st.caption(
+        "Calculate a separate shortest path from every selected origin "
+        "to the same destination. Example: 1 → 444, 2 → 444, "
+        "3 → 444 and 4 → 444."
+    )
+
+    multi_col1, multi_col2 = st.columns([2, 1])
+
+    with multi_col1:
+        multi_origin_labels = st.multiselect(
+            "Origin buildings",
+            options=building_labels,
+            key="multi_origin_buildings_select",
+        )
+
+    with multi_col2:
+        multi_destination_label = st.selectbox(
+            "Common destination",
+            options=building_labels,
+            key="multi_destination_building_select",
+        )
+
+    if st.button(
+        "Calculate separate routes to destination",
+        type="primary",
+        key="calculate_multi_origin_routes_button",
+    ):
+        try:
+            origin_ids = [building_label_to_fid[label] for label in multi_origin_labels]
+            destination_id = building_label_to_fid[multi_destination_label]
+
+            with st.spinner("Calculating separate shortest paths..."):
+                multi_results, multi_table = (
+                    calculate_routes_from_origins_to_destination(
+                        origin_ids=origin_ids,
+                        destination_id=destination_id,
+                    )
+                )
+
+            st.session_state.multi_route_results = multi_results
+            st.session_state.multi_route_table = multi_table
+            st.session_state.multi_route_destination = destination_id
+            st.session_state.independent_route_mode = "multiple_origins_one_destination"
+
+            # Clear the previous single/ordered route so the modes do not overlap.
+            st.session_state.route_result = None
+            st.session_state.route_legs = None
+            st.session_state.total_distance = None
+            st.session_state.selected_building_ids = None
+            st.session_state.service_area_results = None
+            st.session_state.service_area_table = None
+            st.session_state.service_area_origin = None
+            st.session_state.service_area_minutes = None
+
+            st.success(
+                f"Calculated {len(multi_results)} separate shortest paths "
+                f"to Building {destination_id}."
+            )
+
+        except Exception as error:
+            st.error(f"Unable to calculate the separate routes: {error}")
+
+# ============================================================
+# COLLAPSIBLE: 🌐 One Origin → Multiple Destinations
+# ============================================================
+
+with st.expander("🌐 One Origin → Multiple Destinations", expanded=False):
+    st.caption(
+        "Calculate a separate shortest path from one origin to every "
+        "selected destination. Example: 10 → 20, 10 → 30 and 10 → 40."
+    )
+
+    one_many_col1, one_many_col2 = st.columns([1, 2])
+
+    with one_many_col1:
+        one_origin_label = st.selectbox(
+            "Common origin",
+            options=building_labels,
+            key="one_origin_building_select",
+        )
+
+    with one_many_col2:
+        multiple_destination_labels = st.multiselect(
+            "Destination buildings",
+            options=building_labels,
+            key="multiple_destination_buildings_select",
+        )
+
+    if st.button(
+        "Calculate separate routes from origin",
+        type="primary",
+        key="calculate_one_origin_routes_button",
+    ):
+        try:
+            origin_id = building_label_to_fid[
+                one_origin_label
+            ]
+
+            destination_ids = [
+                building_label_to_fid[label]
+                for label in multiple_destination_labels
+            ]
+
+            with st.spinner(
+                "Calculating separate shortest paths..."
+            ):
+                multi_results, multi_table = (
+                    calculate_routes_from_origin_to_destinations(
+                        origin_id=origin_id,
+                        destination_ids=destination_ids,
+                    )
+                )
+
+            st.session_state.multi_route_results = multi_results
+            st.session_state.multi_route_table = multi_table
+            st.session_state.multi_route_destination = None
+            st.session_state.independent_route_mode = (
+                "one_origin_multiple_destinations"
+            )
+
+            st.session_state.route_result = None
+            st.session_state.route_legs = None
+            st.session_state.total_distance = None
+            st.session_state.selected_building_ids = None
+            st.session_state.service_area_results = None
+            st.session_state.service_area_table = None
+            st.session_state.service_area_origin = None
+            st.session_state.service_area_minutes = None
+
+            st.success(
+                f"Calculated {len(multi_results)} separate shortest paths "
+                f"from Building {origin_id}."
+            )
+
+        except Exception as error:
+            st.error(
+                f"Unable to calculate the separate routes: {error}"
+            )
+
+# ============================================================
+# COLLAPSIBLE: ⏱️ Service Area (Isochrone)
+# ============================================================
+
+with st.expander("⏱️ Service Area (Isochrone)", expanded=False):
+    st.caption(
+        "Select one starting building, a time limit and one or more travel "
+        "modes. The GIS engine highlights the road network and buildings "
+        "reachable within that time. Each travel mode uses its own assumed "
+        "average speed."
+    )
+
+    service_col1, service_col2, service_col3 = st.columns([2, 1, 2])
+
+    with service_col1:
+        service_origin_label = st.selectbox(
+            "Starting building",
+            options=building_labels,
+            key="service_area_origin_select",
+        )
+
+    with service_col2:
+        service_minutes = st.number_input(
+            "Travel-time limit (minutes)",
+            min_value=1.0,
+            max_value=120.0,
+            value=5.0,
+            step=1.0,
+            key="service_area_minutes_input",
+        )
+
+    with service_col3:
+        service_modes = st.multiselect(
+            "Travel modes",
+            options=list(TRAVEL_SPEEDS_KMH.keys()),
+            default=["Walking"],
+            key="service_area_modes_select",
+        )
+
+    st.caption(
+        "Example comparison: select Walking, E-bike and Car driving with "
+        "a 5-minute limit to compare how many buildings are reachable."
+    )
+
+    if st.button(
+        "Calculate service area",
+        type="primary",
+        key="calculate_service_area_button",
+    ):
+        try:
+            service_origin_id = building_label_to_fid[
+                service_origin_label
+            ]
+
+            with st.spinner(
+                "Calculating network service areas and reachable buildings..."
+            ):
+                service_results, service_table = calculate_service_areas(
+                    origin_id=service_origin_id,
+                    minutes=service_minutes,
+                    travel_modes=service_modes,
+                )
+
+            st.session_state.service_area_results = service_results
+            st.session_state.service_area_table = service_table
+            st.session_state.service_area_origin = service_origin_id
+            st.session_state.service_area_minutes = float(service_minutes)
+
+            # Clear route outputs so different analyses do not overlap.
+            st.session_state.route_result = None
+            st.session_state.route_legs = None
+            st.session_state.total_distance = None
+            st.session_state.selected_building_ids = None
+            st.session_state.multi_route_results = None
+            st.session_state.multi_route_table = None
+            st.session_state.multi_route_destination = None
+            st.session_state.independent_route_mode = None
+
+            st.success(
+                f"Calculated {len(service_results)} service area(s) "
+                f"from Building {service_origin_id}."
+            )
+
+        except Exception as error:
+            st.error(f"Unable to calculate service area: {error}")
 
 # ============================================================
 # 15. CLEAR ROUTE
