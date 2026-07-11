@@ -1960,7 +1960,7 @@ with st.form(
     clear_on_submit=False,
 ):
     question = st.text_input(
-        "Enter your GIS request",
+        "Enter your query request",
         value=st.session_state.last_question,
         placeholder=(
             "Example: Find the shortest route from Building 10 "
