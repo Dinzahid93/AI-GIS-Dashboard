@@ -1941,10 +1941,7 @@ st.caption(
     "Manual tools remain available below in collapsible panels."
 )
 
-st.metric(
-    "Buildings",
-    f"{len(buildings_wgs):,}",
-)
+
 
 
 # ============================================================
