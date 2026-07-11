@@ -1934,7 +1934,7 @@ def create_map(
 # 11. STREAMLIT HEADER
 # ============================================================
 
-st.title("🗺️ AI GIS Dashboard")
+st.title("🗺️ LLM Powered UiTM Shah Alam Campus Map")
 
 st.caption(
     "Ask the AI GIS Assistant to run routing and service-area analyses. "
