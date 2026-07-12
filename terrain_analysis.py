@@ -1,16 +1,18 @@
 """
-Simplified Terrain Analysis module for the UiTM Shah Alam GIS dashboard.
+Terrain Analysis module for the UiTM Shah Alam GIS dashboard.
 
-This version keeps the interface clean and adds:
-- One terrain map only
+Features:
 - Orthophoto, DTM, DSM, buildings and roads
 - Terrain GIS Assistant
-- Actual DTM elevation from data/here.tif
-- Automatic building highlight and zoom
-- Elevation marker and popup
-- No swipe comparison
-- No opacity slider
-- No map-click reruns
+- Ground elevation from DTM
+- Surface elevation from DSM
+- Estimated building height from DSM minus DTM
+- Automatic building highlight, zoom, marker and popup
+- Stable map without swipe or map-click reruns
+
+Required raster files:
+    data/here.tif
+    data/DSMUITM_Resample_CopyRast.tif
 """
 
 from __future__ import annotations
@@ -29,7 +31,9 @@ from streamlit_folium import st_folium
 
 from terrain_engine import (
     TerrainSamplingError,
+    calculate_building_height,
     sample_elevation_wgs84,
+    sample_surface_elevation_wgs84,
 )
 
 
@@ -396,7 +400,7 @@ def _add_road_layer(
 def _fallback_parse_terrain_command(
     question: str,
 ) -> dict[str, Any]:
-    """Parse a building-elevation request without Gemini."""
+    """Parse supported terrain commands without Gemini."""
 
     text = question.lower().strip()
 
@@ -405,22 +409,69 @@ def _fallback_parse_terrain_command(
         text,
     )
 
-    terrain_words = [
-        "elevation",
-        "height",
-        "ground level",
-        "terrain level",
-        "altitude",
-    ]
-
-    if (
-        building_match is not None
-        and any(word in text for word in terrain_words)
-    ):
-        building_id = int(building_match.group(1))
-
+    if building_match is None:
         return {
-            "action": "building_elevation",
+            "action": "unknown",
+            "reply": (
+                "Try asking for the ground elevation, surface elevation, "
+                "or estimated height of a building."
+            ),
+        }
+
+    building_id = int(
+        building_match.group(1)
+    )
+
+    if any(
+        phrase in text
+        for phrase in [
+            "estimated height",
+            "building height",
+            "height of building",
+            "how tall",
+            "tall is",
+        ]
+    ):
+        return {
+            "action": "building_height",
+            "building_id": building_id,
+            "reply": (
+                f"Calculating the estimated height of Building "
+                f"{building_id} using DSM minus DTM."
+            ),
+        }
+
+    if any(
+        phrase in text
+        for phrase in [
+            "surface elevation",
+            "dsm elevation",
+            "roof elevation",
+            "surface level",
+        ]
+    ):
+        return {
+            "action": "building_surface_elevation",
+            "building_id": building_id,
+            "reply": (
+                f"Retrieving the DSM surface elevation "
+                f"for Building {building_id}."
+            ),
+        }
+
+    if any(
+        phrase in text
+        for phrase in [
+            "ground elevation",
+            "dtm elevation",
+            "elevation",
+            "ground level",
+            "terrain level",
+            "altitude",
+        ]
+    ):
+        return {
+            "action": "building_ground_elevation",
             "building_id": building_id,
             "reply": (
                 f"Retrieving the DTM ground elevation "
@@ -431,7 +482,7 @@ def _fallback_parse_terrain_command(
     return {
         "action": "unknown",
         "reply": (
-            "Try: What is the elevation at Building 10?"
+            "Try: What is the ground elevation at Building 10?"
         ),
     }
 
@@ -474,40 +525,59 @@ def _interpret_terrain_command(
     model_name: str,
 ) -> dict[str, Any]:
     """
-    Use Gemini to interpret the request.
+    Use Gemini to interpret the terrain request.
 
-    The actual elevation is always calculated by the GIS engine.
+    The GIS engine calculates all actual values.
     """
 
     if not api_key:
-        return _fallback_parse_terrain_command(question)
+        return _fallback_parse_terrain_command(
+            question
+        )
 
     try:
         from google import genai
 
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(
+            api_key=api_key
+        )
 
         prompt = f"""
-You are a GIS command interpreter for a terrain dashboard.
+You are a GIS command interpreter for a terrain-analysis dashboard.
 
-The dashboard currently supports one action:
-building_elevation
+Supported actions:
 
-Return JSON only:
+1. Ground elevation from DTM
 {{
-  "action": "building_elevation",
+  "action": "building_ground_elevation",
   "building_id": 10,
   "reply": "Retrieving the DTM ground elevation for Building 10."
 }}
 
-Rules:
-- Extract the building number exactly.
-- Never invent an elevation value.
-- For unsupported requests return:
+2. Surface elevation from DSM
+{{
+  "action": "building_surface_elevation",
+  "building_id": 10,
+  "reply": "Retrieving the DSM surface elevation for Building 10."
+}}
+
+3. Estimated building height from DSM minus DTM
+{{
+  "action": "building_height",
+  "building_id": 10,
+  "reply": "Calculating the estimated height of Building 10 using DSM minus DTM."
+}}
+
+4. Unsupported
 {{
   "action": "unknown",
   "reply": "The terrain request is not supported."
 }}
+
+Rules:
+- Extract the building number exactly.
+- Never calculate or invent elevation or height values.
+- Return valid JSON only.
 
 User request:
 {question}
@@ -526,7 +596,9 @@ User request:
         )
 
         if parsed.get("action") not in {
-            "building_elevation",
+            "building_ground_elevation",
+            "building_surface_elevation",
+            "building_height",
             "unknown",
         }:
             raise ValueError(
@@ -536,7 +608,10 @@ User request:
         return parsed
 
     except Exception:
-        return _fallback_parse_terrain_command(question)
+        return _fallback_parse_terrain_command(
+            question
+        )
+
 
 
 # ============================================================
@@ -551,11 +626,7 @@ def create_terrain_map(
     zoom_start: int,
     selected_result: Optional[dict[str, Any]] = None,
 ) -> folium.Map:
-    """
-    Create one stable terrain map containing Orthophoto, DTM and DSM.
-
-    Users control visibility directly from the Folium layer control.
-    """
+    """Create one stable terrain map."""
 
     terrain_map = folium.Map(
         location=list(map_center),
@@ -566,7 +637,6 @@ def create_terrain_map(
         prefer_canvas=True,
     )
 
-    # Base map
     folium.TileLayer(
         tiles="OpenStreetMap",
         name="OpenStreetMap",
@@ -576,7 +646,6 @@ def create_terrain_map(
         max_zoom=23,
     ).add_to(terrain_map)
 
-    # Orthophoto overlay
     orthophoto_layer = None
 
     if orthophoto_tile_url:
@@ -588,9 +657,10 @@ def create_terrain_map(
             max_zoom=23,
         )
 
-        orthophoto_layer.add_to(terrain_map)
+        orthophoto_layer.add_to(
+            terrain_map
+        )
 
-    # DTM overlay
     folium.TileLayer(
         tiles=DTM_TILE_URL,
         name="Digital Terrain Model",
@@ -603,7 +673,6 @@ def create_terrain_map(
         max_zoom=23,
     ).add_to(terrain_map)
 
-    # DSM overlay
     folium.TileLayer(
         tiles=DSM_TILE_URL,
         name="Digital Surface Model",
@@ -616,7 +685,6 @@ def create_terrain_map(
         max_zoom=23,
     ).add_to(terrain_map)
 
-    # Optional vector overlays, available in the same layer control.
     _add_road_layer(
         map_object=terrain_map,
         roads_geojson=roads_geojson,
@@ -627,18 +695,17 @@ def create_terrain_map(
         buildings_geojson=buildings_geojson,
     )
 
-    # Highlight the building used in the latest elevation query.
     if (
         selected_result is not None
         and buildings_geojson is not None
     ):
-        selected_building_id = int(
+        building_id = int(
             selected_result["building_id"]
         )
 
         selected_feature = _find_building_feature(
             buildings_geojson=buildings_geojson,
-            building_id=selected_building_id,
+            building_id=building_id,
         )
 
         selected_geometry = shape(
@@ -649,28 +716,58 @@ def create_terrain_map(
             selected_geometry.representative_point()
         )
 
-        selected_name = str(
+        building_name = str(
             selected_result.get(
                 "building_name",
-                f"Building {selected_building_id}",
+                f"Building {building_id}",
             )
         )
 
-        selected_elevation = float(
-            selected_result["elevation_m"]
+        action = str(
+            selected_result.get(
+                "action",
+                "",
+            )
         )
 
-        selected_layer = folium.FeatureGroup(
-            name="Selected Elevation Building",
+        if action == "building_ground_elevation":
+            popup_value = (
+                f"Ground elevation: "
+                f"{selected_result['ground_elevation_m']:.2f} m"
+            )
+            marker_value = (
+                f"{selected_result['ground_elevation_m']:.2f} m"
+            )
+
+        elif action == "building_surface_elevation":
+            popup_value = (
+                f"Surface elevation: "
+                f"{selected_result['surface_elevation_m']:.2f} m"
+            )
+            marker_value = (
+                f"{selected_result['surface_elevation_m']:.2f} m"
+            )
+
+        else:
+            popup_value = (
+                f"Ground elevation: "
+                f"{selected_result['ground_elevation_m']:.2f} m<br>"
+                f"Surface elevation: "
+                f"{selected_result['surface_elevation_m']:.2f} m<br>"
+                f"Estimated height: "
+                f"{selected_result['estimated_height_m']:.2f} m"
+            )
+            marker_value = (
+                f"{selected_result['estimated_height_m']:.2f} m"
+            )
+
+        selected_group = folium.FeatureGroup(
+            name="Selected Terrain Building",
             show=True,
         )
 
         folium.GeoJson(
             selected_feature,
-            name=(
-                f"Selected Building "
-                f"{selected_building_id}"
-            ),
             style_function=lambda feature: {
                 "color": "#DC2626",
                 "weight": 5,
@@ -683,13 +780,12 @@ def create_terrain_map(
                 "fillOpacity": 0.88,
             },
             tooltip=folium.Tooltip(
-                f"<b>Building {selected_building_id}</b><br>"
-                f"{selected_name}<br>"
-                f"Ground elevation: "
-                f"{selected_elevation:.2f} m",
+                f"<b>Building {building_id}</b><br>"
+                f"{building_name}<br>"
+                f"{popup_value}",
                 sticky=True,
             ),
-        ).add_to(selected_layer)
+        ).add_to(selected_group)
 
         folium.Marker(
             location=[
@@ -697,28 +793,27 @@ def create_terrain_map(
                 selected_point.x,
             ],
             tooltip=(
-                f"Building {selected_building_id}: "
-                f"{selected_elevation:.2f} m"
+                f"Building {building_id}: "
+                f"{marker_value}"
             ),
             popup=folium.Popup(
                 html=(
-                    f"<b>Building {selected_building_id}</b><br>"
-                    f"{selected_name}<br>"
-                    f"<b>Ground elevation:</b> "
-                    f"{selected_elevation:.2f} m"
+                    f"<b>Building {building_id}</b><br>"
+                    f"{building_name}<br>"
+                    f"{popup_value}"
                 ),
-                max_width=280,
+                max_width=300,
             ),
             icon=folium.DivIcon(
-                icon_size=(82, 34),
-                icon_anchor=(41, 17),
+                icon_size=(90, 34),
+                icon_anchor=(45, 17),
                 html=f"""
                 <div style="
                     background:#DC2626;
                     color:#FFFFFF;
                     border:3px solid #FFFFFF;
                     border-radius:18px;
-                    min-width:76px;
+                    min-width:84px;
                     padding:5px 9px;
                     text-align:center;
                     font-size:13px;
@@ -726,26 +821,24 @@ def create_terrain_map(
                     box-shadow:0 2px 7px rgba(0,0,0,.55);
                     white-space:nowrap;
                 ">
-                    {selected_elevation:.2f} m
+                    {marker_value}
                 </div>
                 """,
             ),
-        ).add_to(selected_layer)
+        ).add_to(selected_group)
 
-        selected_layer.add_to(terrain_map)
+        selected_group.add_to(
+            terrain_map
+        )
 
-        selected_bounds = selected_geometry.bounds
+        min_x, min_y, max_x, max_y = (
+            selected_geometry.bounds
+        )
 
         terrain_map.fit_bounds(
             [
-                [
-                    selected_bounds[1],
-                    selected_bounds[0],
-                ],
-                [
-                    selected_bounds[3],
-                    selected_bounds[2],
-                ],
+                [min_y, min_x],
+                [max_y, max_x],
             ],
             padding=(120, 120),
             max_zoom=19,
@@ -763,9 +856,10 @@ def create_terrain_map(
         position="topleft",
     )
 
-    layer_control.add_to(terrain_map)
+    layer_control.add_to(
+        terrain_map
+    )
 
-    # Register the custom orthophoto layer in the normal layer control.
     if orthophoto_layer is not None:
         terrain_map.get_root().script.add_child(
             folium.Element(
@@ -790,10 +884,6 @@ def create_terrain_map(
     return terrain_map
 
 
-# ============================================================
-# 4. STREAMLIT TERRAIN TAB
-# ============================================================
-
 def show_terrain_analysis(
     orthophoto_tile_url: Optional[str] = None,
     buildings_geojson: Optional[dict[str, Any]] = None,
@@ -801,10 +891,10 @@ def show_terrain_analysis(
     map_center: tuple[float, float] = (3.0697, 101.5033),
     zoom_start: int = 16,
 ) -> None:
-    """Display the LLM-enabled Terrain Analysis tab."""
+    """Display the DTM/DSM-enabled Terrain Analysis tab."""
 
-    if "terrain_elevation_result" not in st.session_state:
-        st.session_state.terrain_elevation_result = None
+    if "terrain_result" not in st.session_state:
+        st.session_state.terrain_result = None
 
     if "terrain_question" not in st.session_state:
         st.session_state.terrain_question = ""
@@ -812,13 +902,9 @@ def show_terrain_analysis(
     st.subheader("⛰️ Terrain Analysis")
 
     st.caption(
-        "Use natural language to retrieve ground elevation from the DTM. "
-        "The selected building is highlighted automatically on the map."
+        "Use natural language to retrieve DTM ground elevation, DSM surface "
+        "elevation, or estimated building height."
     )
-
-    # --------------------------------------------------------
-    # TERRAIN GIS ASSISTANT
-    # --------------------------------------------------------
 
     st.markdown("### Terrain GIS Assistant")
 
@@ -830,40 +916,48 @@ def show_terrain_analysis(
             "Enter a terrain GIS request",
             value=st.session_state.terrain_question,
             placeholder=(
-                "Example: What is the elevation at Building 10?"
+                "Example: What is the estimated height of Building 470?"
             ),
         )
 
         with st.expander(
-            "Example terrain command",
+            "Example terrain commands",
             expanded=False,
         ):
-            st.code(
-                "What is the elevation at Building 10?"
+            st.markdown(
+                """
+                `What is the ground elevation at Building 470?`
+
+                `What is the surface elevation at Building 470?`
+
+                `What is the estimated height of Building 470?`
+                """
             )
 
         run_col, clear_col = st.columns([3, 1])
 
         with run_col:
-            terrain_submitted = st.form_submit_button(
+            submitted = st.form_submit_button(
                 "▶ Run Terrain Analysis",
                 type="primary",
                 use_container_width=True,
             )
 
         with clear_col:
-            terrain_clear = st.form_submit_button(
+            clear_pressed = st.form_submit_button(
                 "🗑️ Clear",
                 use_container_width=True,
             )
 
-    if terrain_clear:
-        st.session_state.terrain_elevation_result = None
+    if clear_pressed:
+        st.session_state.terrain_result = None
         st.session_state.terrain_question = ""
         st.rerun()
 
-    if terrain_submitted:
-        st.session_state.terrain_question = terrain_question
+    if submitted:
+        st.session_state.terrain_question = (
+            terrain_question
+        )
 
         if not terrain_question.strip():
             st.warning(
@@ -897,51 +991,102 @@ def show_terrain_analysis(
                     model_name=model_name,
                 )
 
-                if parsed.get("action") == "building_elevation":
+                action = parsed.get(
+                    "action",
+                    "unknown",
+                )
+
+                if action == "unknown":
+                    st.warning(
+                        parsed.get(
+                            "reply",
+                            "The request is not supported.",
+                        )
+                    )
+
+                else:
                     building_id = int(
                         parsed["building_id"]
                     )
 
-                    longitude, latitude = _building_point_wgs84(
+                    building_feature = _find_building_feature(
                         buildings_geojson=buildings_geojson,
                         building_id=building_id,
                     )
 
-                    with st.spinner(
-                        "Reading the DTM elevation value..."
-                    ):
-                        elevation = sample_elevation_wgs84(
-                            longitude=longitude,
-                            latitude=latitude,
-                        )
+                    building_name = _building_name(
+                        buildings_geojson,
+                        building_id,
+                    )
 
-                    st.session_state.terrain_elevation_result = {
-                        "building_id": building_id,
-                        "building_name": _building_name(
-                            buildings_geojson,
-                            building_id,
-                        ),
-                        "longitude": longitude,
-                        "latitude": latitude,
-                        "elevation_m": float(elevation),
-                    }
+                    longitude, latitude = (
+                        _building_point_wgs84(
+                            buildings_geojson=buildings_geojson,
+                            building_id=building_id,
+                        )
+                    )
+
+                    with st.spinner(
+                        "Reading terrain raster values..."
+                    ):
+                        if action == "building_ground_elevation":
+                            ground = sample_elevation_wgs84(
+                                longitude=longitude,
+                                latitude=latitude,
+                            )
+
+                            result = {
+                                "action": action,
+                                "building_id": building_id,
+                                "building_name": building_name,
+                                "longitude": longitude,
+                                "latitude": latitude,
+                                "ground_elevation_m": float(ground),
+                            }
+
+                        elif action == "building_surface_elevation":
+                            surface = sample_surface_elevation_wgs84(
+                                longitude=longitude,
+                                latitude=latitude,
+                            )
+
+                            result = {
+                                "action": action,
+                                "building_id": building_id,
+                                "building_name": building_name,
+                                "longitude": longitude,
+                                "latitude": latitude,
+                                "surface_elevation_m": float(surface),
+                            }
+
+                        else:
+                            height_result = calculate_building_height(
+                                building_geometry_geojson=(
+                                    building_feature["geometry"]
+                                )
+                            )
+
+                            result = {
+                                "action": action,
+                                "building_id": building_id,
+                                "building_name": building_name,
+                                "longitude": longitude,
+                                "latitude": latitude,
+                                **height_result,
+                            }
+
+                    st.session_state.terrain_result = (
+                        result
+                    )
 
                     st.success(
                         f"Building {building_id} was identified and "
                         "analysed successfully."
                     )
 
-                else:
-                    st.warning(
-                        parsed.get(
-                            "reply",
-                            "The terrain request is not supported.",
-                        )
-                    )
-
             except TerrainSamplingError as error:
                 st.error(
-                    f"Could not retrieve elevation: {error}"
+                    f"Terrain analysis failed: {error}"
                 )
 
             except ValueError as error:
@@ -949,37 +1094,57 @@ def show_terrain_analysis(
 
             except Exception as error:
                 st.error(
-                    f"Terrain analysis failed: {error}"
+                    f"Unexpected terrain-analysis error: {error}"
                 )
 
-    # --------------------------------------------------------
-    # RESULT CARD
-    # --------------------------------------------------------
-
-    result = st.session_state.terrain_elevation_result
+    result = st.session_state.terrain_result
 
     if result:
         st.markdown("### Terrain analysis result")
 
-        metric_col1, metric_col2 = st.columns([2, 1])
+        action = result["action"]
 
-        with metric_col1:
+        if action == "building_ground_elevation":
             st.metric(
-                label=(
-                    f"Ground elevation at "
-                    f"Building {result['building_id']}"
-                ),
-                value=f"{result['elevation_m']:.2f} m",
+                "Ground elevation",
+                f"{result['ground_elevation_m']:.2f} m",
             )
 
-        with metric_col2:
+        elif action == "building_surface_elevation":
             st.metric(
-                label="Building ID",
-                value=str(result["building_id"]),
+                "Surface elevation",
+                f"{result['surface_elevation_m']:.2f} m",
+            )
+
+        else:
+            metric1, metric2, metric3 = st.columns(3)
+
+            with metric1:
+                st.metric(
+                    "Ground elevation",
+                    f"{result['ground_elevation_m']:.2f} m",
+                )
+
+            with metric2:
+                st.metric(
+                    "Surface elevation",
+                    f"{result['surface_elevation_m']:.2f} m",
+                )
+
+            with metric3:
+                st.metric(
+                    "Estimated building height",
+                    f"{result['estimated_height_m']:.2f} m",
+                )
+
+            st.caption(
+                "Estimated height uses median DSM minus median DTM "
+                "inside the building footprint."
             )
 
         st.caption(
-            f"Building name: {result['building_name']}"
+            f"Building {result['building_id']}: "
+            f"{result['building_name']}"
         )
 
         st.caption(
@@ -988,15 +1153,11 @@ def show_terrain_analysis(
             f"{result['longitude']:.6f}"
         )
 
-    # --------------------------------------------------------
-    # TERRAIN MAP
-    # --------------------------------------------------------
-
     st.markdown("### Terrain map")
 
     st.caption(
-        "Use the map layer control to switch the orthophoto, DTM, DSM, "
-        "buildings and road network on or off."
+        "Use the layer control to switch the orthophoto, DTM, DSM, "
+        "building footprints and road network on or off."
     )
 
     terrain_map = create_terrain_map(
@@ -1008,8 +1169,8 @@ def show_terrain_analysis(
         selected_result=result,
     )
 
-    selected_id = (
-        result["building_id"]
+    result_key = (
+        f"{result['building_id']}_{result['action']}"
         if result
         else "none"
     )
@@ -1020,24 +1181,24 @@ def show_terrain_analysis(
         height=720,
         returned_objects=[],
         use_container_width=True,
-        key=f"terrain_analysis_map_{selected_id}",
+        key=f"terrain_analysis_map_{result_key}",
     )
 
     with st.expander(
-        "How to interpret the terrain layers",
+        "How the terrain values are calculated",
         expanded=False,
     ):
         st.markdown(
             """
-            **Orthophoto**  
-            Shows the visible campus surface captured by the UAV camera.
+            **Ground elevation**  
+            Sampled from the DTM stored in `data/here.tif`.
 
-            **Digital Terrain Model (DTM)**  
-            Represents the approximate bare-earth ground surface. The
-            elevation value is sampled from `data/here.tif` in metres.
+            **Surface elevation**  
+            Sampled from the DSM stored in
+            `data/DSMUITM_Resample_CopyRast.tif`.
 
-            **Digital Surface Model (DSM)**  
-            Represents the upper visible surface, including buildings,
-            vegetation and other above-ground objects.
+            **Estimated building height**  
+            Calculated from the median DSM elevation minus the median DTM
+            elevation inside the selected building footprint.
             """
         )
