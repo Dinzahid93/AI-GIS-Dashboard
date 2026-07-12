@@ -279,6 +279,61 @@ def _add_roads(
     ).add_to(map_object)
 
 
+def _make_swipe_layer(
+    layer_name: str,
+    orthophoto_tile_url: Optional[str],
+    opacity: float,
+    side_label: str,
+) -> folium.TileLayer:
+    """Create one selectable layer for the swipe comparison."""
+
+    if layer_name == "Orthophoto":
+        if not orthophoto_tile_url:
+            raise ValueError(
+                "The orthophoto tile URL is not available."
+            )
+
+        return folium.TileLayer(
+            tiles=orthophoto_tile_url,
+            name=f"Orthophoto — {side_label}",
+            attr="UiTM Shah Alam UAV Orthomosaic",
+            overlay=True,
+            control=False,
+            show=True,
+            opacity=opacity,
+            max_native_zoom=20,
+            max_zoom=23,
+        )
+
+    if layer_name == "DTM":
+        return folium.TileLayer(
+            tiles=DTM_TILE_URL,
+            name=f"DTM — {side_label}",
+            attr="UiTM Shah Alam DTM",
+            overlay=True,
+            control=False,
+            show=True,
+            opacity=opacity,
+            max_native_zoom=20,
+            max_zoom=23,
+        )
+
+    if layer_name == "DSM":
+        return folium.TileLayer(
+            tiles=DSM_TILE_URL,
+            name=f"DSM — {side_label}",
+            attr="UiTM Shah Alam DSM",
+            overlay=True,
+            control=False,
+            show=True,
+            opacity=opacity,
+            max_native_zoom=20,
+            max_zoom=23,
+        )
+
+    raise ValueError(f"Unsupported swipe layer: {layer_name}")
+
+
 def create_terrain_map(
     display_mode: str,
     terrain_opacity: float,
@@ -290,8 +345,10 @@ def create_terrain_map(
     roads_geojson: Optional[dict[str, Any]],
     map_center: tuple[float, float],
     zoom_start: int,
+    swipe_left_layer: str = "Orthophoto",
+    swipe_right_layer: str = "DTM",
 ) -> folium.Map:
-    """Build the terrain visualisation map."""
+    """Build the terrain visualisation or selectable swipe map."""
 
     terrain_map = folium.Map(
         location=list(map_center),
@@ -313,7 +370,14 @@ def create_terrain_map(
 
     orthophoto_layer = None
 
-    if orthophoto_tile_url and show_orthophoto:
+    # In normal terrain display, add the custom transparent orthophoto.
+    # In swipe display, the selected orthophoto is inserted into the
+    # SideBySideLayers control instead.
+    if (
+        display_mode != "Swipe comparison"
+        and orthophoto_tile_url
+        and show_orthophoto
+    ):
         orthophoto_layer = TransparentWhiteTileLayer(
             tile_url=orthophoto_tile_url,
             white_threshold=245,
@@ -374,37 +438,32 @@ def create_terrain_map(
             max_zoom=23,
         ).add_to(terrain_map)
 
-    elif display_mode == "DTM vs DSM Swipe":
-        dtm_layer = folium.TileLayer(
-            tiles=DTM_TILE_URL,
-            name="DTM — Left",
-            attr="UiTM Shah Alam DTM",
-            overlay=True,
-            control=False,
-            show=True,
+    elif display_mode == "Swipe comparison":
+        if swipe_left_layer == swipe_right_layer:
+            raise ValueError(
+                "Choose two different layers for the swipe comparison."
+            )
+
+        left_layer = _make_swipe_layer(
+            layer_name=swipe_left_layer,
+            orthophoto_tile_url=orthophoto_tile_url,
             opacity=terrain_opacity,
-            max_native_zoom=20,
-            max_zoom=23,
+            side_label="Left",
         )
 
-        dsm_layer = folium.TileLayer(
-            tiles=DSM_TILE_URL,
-            name="DSM — Right",
-            attr="UiTM Shah Alam DSM",
-            overlay=True,
-            control=False,
-            show=True,
+        right_layer = _make_swipe_layer(
+            layer_name=swipe_right_layer,
+            orthophoto_tile_url=orthophoto_tile_url,
             opacity=terrain_opacity,
-            max_native_zoom=20,
-            max_zoom=23,
+            side_label="Right",
         )
 
-        dtm_layer.add_to(terrain_map)
-        dsm_layer.add_to(terrain_map)
+        left_layer.add_to(terrain_map)
+        right_layer.add_to(terrain_map)
 
         SideBySideLayers(
-            layer_left=dtm_layer,
-            layer_right=dsm_layer,
+            layer_left=left_layer,
+            layer_right=right_layer,
         ).add_to(terrain_map)
 
     _add_roads(
@@ -475,8 +534,8 @@ def show_terrain_analysis(
     st.subheader("⛰️ Terrain Analysis")
 
     st.caption(
-        "Visualise and compare the Digital Terrain Model and Digital "
-        "Surface Model generated from the UiTM Shah Alam UAV survey."
+        "Visualise the DTM and DSM, or select any two available raster "
+        "layers for an interactive swipe comparison."
     )
 
     control_col1, control_col2 = st.columns([2, 1])
@@ -488,59 +547,94 @@ def show_terrain_analysis(
                 "DTM",
                 "DSM",
                 "DTM and DSM",
-                "DTM vs DSM Swipe",
+                "Swipe comparison",
             ],
             index=0,
             key="terrain_display_mode",
         )
 
     with control_col2:
-        terrain_opacity = st.slider(
-            "Terrain opacity",
-            min_value=0.10,
-            max_value=1.00,
-            value=0.80,
-            step=0.05,
-            key="terrain_opacity",
+        terrain_opacity = 1.0
+        st.markdown("**Raster opacity:** 100%")
+
+    swipe_left_layer = "Orthophoto"
+    swipe_right_layer = "DTM"
+
+    if display_mode == "Swipe comparison":
+        st.markdown("#### Select comparison layers")
+
+        swipe_col1, swipe_col2 = st.columns(2)
+
+        swipe_options = [
+            "Orthophoto",
+            "DTM",
+            "DSM",
+        ]
+
+        with swipe_col1:
+            swipe_left_layer = st.selectbox(
+                "Left layer",
+                options=swipe_options,
+                index=0,
+                key="terrain_swipe_left_layer",
+            )
+
+        with swipe_col2:
+            default_right_index = (
+                1 if swipe_left_layer != "DTM" else 2
+            )
+
+            swipe_right_layer = st.selectbox(
+                "Right layer",
+                options=swipe_options,
+                index=default_right_index,
+                key="terrain_swipe_right_layer",
+            )
+
+        if swipe_left_layer == swipe_right_layer:
+            st.warning(
+                "Select two different layers. For example: "
+                "Orthophoto vs DTM, Orthophoto vs DSM, or DTM vs DSM."
+            )
+
+        st.caption(
+            f"Swipe comparison: {swipe_left_layer} on the left and "
+            f"{swipe_right_layer} on the right."
         )
 
-    toggle_col1, toggle_col2, toggle_col3 = st.columns(3)
+    show_orthophoto = display_mode != "Swipe comparison"
+    show_buildings = False
+    show_roads = False
 
-    with toggle_col1:
-        show_orthophoto = st.toggle(
-            "Show orthophoto",
-            value=True,
-            key="terrain_show_orthophoto",
+    if (
+        display_mode == "Swipe comparison"
+        and swipe_left_layer == swipe_right_layer
+    ):
+        st.info(
+            "The map will appear after two different comparison "
+            "layers are selected."
+        )
+        return
+
+    try:
+        terrain_map = create_terrain_map(
+            display_mode=display_mode,
+            terrain_opacity=terrain_opacity,
+            show_orthophoto=show_orthophoto,
+            show_buildings=show_buildings,
+            show_roads=show_roads,
+            orthophoto_tile_url=orthophoto_tile_url,
+            buildings_geojson=buildings_geojson,
+            roads_geojson=roads_geojson,
+            map_center=map_center,
+            zoom_start=zoom_start,
+            swipe_left_layer=swipe_left_layer,
+            swipe_right_layer=swipe_right_layer,
         )
 
-    with toggle_col2:
-        show_buildings = st.toggle(
-            "Show buildings",
-            value=False,
-            key="terrain_show_buildings",
-            disabled=buildings_geojson is None,
-        )
-
-    with toggle_col3:
-        show_roads = st.toggle(
-            "Show roads",
-            value=False,
-            key="terrain_show_roads",
-            disabled=roads_geojson is None,
-        )
-
-    terrain_map = create_terrain_map(
-        display_mode=display_mode,
-        terrain_opacity=terrain_opacity,
-        show_orthophoto=show_orthophoto,
-        show_buildings=show_buildings,
-        show_roads=show_roads,
-        orthophoto_tile_url=orthophoto_tile_url,
-        buildings_geojson=buildings_geojson,
-        roads_geojson=roads_geojson,
-        map_center=map_center,
-        zoom_start=zoom_start,
-    )
+    except Exception as error:
+        st.error(f"Could not prepare the terrain map: {error}")
+        return
 
     map_result = st_folium(
         terrain_map,
@@ -550,8 +644,8 @@ def show_terrain_analysis(
         use_container_width=True,
         key=(
             f"terrain_map_{display_mode}_"
-            f"{terrain_opacity}_{show_orthophoto}_"
-            f"{show_buildings}_{show_roads}"
+            f"{swipe_left_layer}_{swipe_right_layer}_"
+            f"{terrain_opacity}_{show_orthophoto}"
         ),
     )
 
@@ -560,19 +654,36 @@ def show_terrain_analysis(
     metric_col1, metric_col2, metric_col3 = st.columns(3)
 
     with metric_col1:
-        st.metric("Selected display", display_mode)
+        if display_mode == "Swipe comparison":
+            st.metric(
+                "Left layer",
+                swipe_left_layer,
+            )
+        else:
+            st.metric(
+                "Selected display",
+                display_mode,
+            )
 
     with metric_col2:
-        st.metric(
-            "Terrain opacity",
-            f"{terrain_opacity * 100:.0f}%",
-        )
+        if display_mode == "Swipe comparison":
+            st.metric(
+                "Right layer",
+                swipe_right_layer,
+            )
+        else:
+            st.metric(
+                "Raster",
+                "100%"
+            )
 
     with metric_col3:
         if display_mode == "DTM":
             representation = "Bare-earth terrain"
         elif display_mode == "DSM":
             representation = "Ground and objects"
+        elif display_mode == "Swipe comparison":
+            representation = "Interactive comparison"
         else:
             representation = "Surface comparison"
 
@@ -593,22 +704,24 @@ def show_terrain_analysis(
         st.info("Click the map to inspect a terrain location.")
 
     with st.expander(
-        "How to interpret DTM and DSM",
+        "How to use the terrain comparison",
         expanded=False,
     ):
         st.markdown(
             """
-            **Digital Terrain Model (DTM)**  
-            Represents the approximate bare-earth ground surface. It is
-            normally used for slope, aspect, drainage and terrain analysis.
+            **Orthophoto versus DTM**  
+            Compare visible campus features with the approximate
+            bare-earth terrain.
 
-            **Digital Surface Model (DSM)**  
-            Represents the upper visible surface, including buildings,
-            vegetation and other objects above the terrain.
+            **Orthophoto versus DSM**  
+            Compare the aerial image with the surface containing buildings,
+            vegetation and other above-ground features.
 
-            **DTM versus DSM swipe**  
-            Drag the vertical slider to compare the bare-earth terrain with
-            the surface containing above-ground features.
+            **DTM versus DSM**  
+            Compare the bare-earth surface against the upper visible surface.
+
+            In **Swipe comparison**, choose the left and right layers, then
+            drag the vertical divider across the map.
             """
         )
 
