@@ -23,7 +23,7 @@ from typing import Any, Optional
 import folium
 import streamlit as st
 from branca.element import MacroElement
-from folium.plugins import Fullscreen, MousePosition, SideBySideLayers
+from folium.plugins import Fullscreen, MousePosition
 from jinja2 import Template
 from streamlit_folium import st_folium
 
@@ -279,59 +279,207 @@ def _add_roads(
     ).add_to(map_object)
 
 
-def _make_swipe_layer(
-    layer_name: str,
-    orthophoto_tile_url: Optional[str],
-    opacity: float,
-    side_label: str,
-) -> folium.TileLayer:
-    """Create one selectable layer for the swipe comparison."""
 
-    if layer_name == "Orthophoto":
-        if not orthophoto_tile_url:
-            raise ValueError(
-                "The orthophoto tile URL is not available."
-            )
+class TransparentSwipeComparison(MacroElement):
+    """
+    Leaflet side-by-side comparison with transparent-white orthophoto tiles.
 
-        return folium.TileLayer(
-            tiles=orthophoto_tile_url,
-            name=f"Orthophoto — {side_label}",
-            attr="UiTM Shah Alam UAV Orthomosaic",
-            overlay=True,
-            control=False,
-            show=True,
-            opacity=opacity,
-            max_native_zoom=20,
-            max_zoom=23,
+    The orthophoto is rendered through a canvas GridLayer so near-white
+    NoData pixels become transparent during swipe comparison.
+    """
+
+    _template = Template(
+        """
+        {% macro script(this, kwargs) %}
+
+        function createTransparentRasterLayer(
+            tileUrl,
+            layerName,
+            attribution,
+            opacity,
+            makeWhiteTransparent
+        ) {
+            if (!makeWhiteTransparent) {
+                return L.tileLayer(tileUrl, {
+                    opacity: opacity,
+                    maxNativeZoom: 20,
+                    maxZoom: 23,
+                    attribution: attribution
+                });
+            }
+
+            var TransparentTileLayer = L.GridLayer.extend({
+                createTile: function(coords, done) {
+                    var tile = document.createElement("canvas");
+                    var size = this.getTileSize();
+
+                    tile.width = size.x;
+                    tile.height = size.y;
+
+                    var context = tile.getContext(
+                        "2d",
+                        {willReadFrequently: true}
+                    );
+
+                    var image = new Image();
+                    image.crossOrigin = "anonymous";
+
+                    var finalUrl = tileUrl
+                        .replace("{z}", coords.z)
+                        .replace("{x}", coords.x)
+                        .replace("{y}", coords.y);
+
+                    image.onload = function() {
+                        try {
+                            context.drawImage(
+                                image,
+                                0,
+                                0,
+                                size.x,
+                                size.y
+                            );
+
+                            var imageData = context.getImageData(
+                                0,
+                                0,
+                                size.x,
+                                size.y
+                            );
+
+                            var pixels = imageData.data;
+
+                            for (
+                                var i = 0;
+                                i < pixels.length;
+                                i += 4
+                            ) {
+                                var red = pixels[i];
+                                var green = pixels[i + 1];
+                                var blue = pixels[i + 2];
+
+                                var nearWhite =
+                                    red >= 245 &&
+                                    green >= 245 &&
+                                    blue >= 245;
+
+                                var neutral =
+                                    Math.abs(red - green) < 8 &&
+                                    Math.abs(red - blue) < 8 &&
+                                    Math.abs(green - blue) < 8;
+
+                                if (nearWhite && neutral) {
+                                    pixels[i + 3] = 0;
+                                }
+                            }
+
+                            context.putImageData(imageData, 0, 0);
+                            done(null, tile);
+
+                        } catch (error) {
+                            context.drawImage(
+                                image,
+                                0,
+                                0,
+                                size.x,
+                                size.y
+                            );
+                            done(null, tile);
+                        }
+                    };
+
+                    image.onerror = function(error) {
+                        done(error, tile);
+                    };
+
+                    image.src = finalUrl;
+                    return tile;
+                }
+            });
+
+            return new TransparentTileLayer({
+                tileSize: 256,
+                opacity: opacity,
+                maxNativeZoom: 20,
+                maxZoom: 23,
+                attribution: attribution
+            });
+        }
+
+        var leftLayer = createTransparentRasterLayer(
+            "{{ this.left_url }}",
+            "{{ this.left_name }}",
+            "{{ this.left_attribution }}",
+            1.0,
+            {{ "true" if this.left_is_orthophoto else "false" }}
+        );
+
+        var rightLayer = createTransparentRasterLayer(
+            "{{ this.right_url }}",
+            "{{ this.right_name }}",
+            "{{ this.right_attribution }}",
+            1.0,
+            {{ "true" if this.right_is_orthophoto else "false" }}
+        );
+
+        leftLayer.addTo({{ this._parent.get_name() }});
+        rightLayer.addTo({{ this._parent.get_name() }});
+
+        L.control.sideBySide(
+            leftLayer,
+            rightLayer
+        ).addTo({{ this._parent.get_name() }});
+
+        {% endmacro %}
+        """
+    )
+
+    default_js = [
+        (
+            "leaflet-side-by-side",
+            "https://cdn.jsdelivr.net/npm/"
+            "leaflet-side-by-side@2.2.0/"
+            "leaflet-side-by-side.min.js",
         )
+    ]
 
-    if layer_name == "DTM":
-        return folium.TileLayer(
-            tiles=DTM_TILE_URL,
-            name=f"DTM — {side_label}",
-            attr="UiTM Shah Alam DTM",
-            overlay=True,
-            control=False,
-            show=True,
-            opacity=opacity,
-            max_native_zoom=20,
-            max_zoom=23,
-        )
+    def __init__(
+        self,
+        left_name: str,
+        right_name: str,
+        orthophoto_tile_url: str,
+    ):
+        super().__init__()
 
-    if layer_name == "DSM":
-        return folium.TileLayer(
-            tiles=DSM_TILE_URL,
-            name=f"DSM — {side_label}",
-            attr="UiTM Shah Alam DSM",
-            overlay=True,
-            control=False,
-            show=True,
-            opacity=opacity,
-            max_native_zoom=20,
-            max_zoom=23,
-        )
+        layer_config = {
+            "Orthophoto": {
+                "url": orthophoto_tile_url,
+                "attribution": "UiTM Shah Alam UAV Orthomosaic",
+                "is_orthophoto": True,
+            },
+            "DTM": {
+                "url": DTM_TILE_URL,
+                "attribution": "UiTM Shah Alam DTM",
+                "is_orthophoto": False,
+            },
+            "DSM": {
+                "url": DSM_TILE_URL,
+                "attribution": "UiTM Shah Alam DSM",
+                "is_orthophoto": False,
+            },
+        }
 
-    raise ValueError(f"Unsupported swipe layer: {layer_name}")
+        left = layer_config[left_name]
+        right = layer_config[right_name]
+
+        self.left_name = left_name
+        self.right_name = right_name
+        self.left_url = left["url"]
+        self.right_url = right["url"]
+        self.left_attribution = left["attribution"]
+        self.right_attribution = right["attribution"]
+        self.left_is_orthophoto = left["is_orthophoto"]
+        self.right_is_orthophoto = right["is_orthophoto"]
+
 
 
 def create_terrain_map(
@@ -444,26 +592,15 @@ def create_terrain_map(
                 "Choose two different layers for the swipe comparison."
             )
 
-        left_layer = _make_swipe_layer(
-            layer_name=swipe_left_layer,
+        if not orthophoto_tile_url:
+            raise ValueError(
+                "The orthophoto tile URL is not available."
+            )
+
+        TransparentSwipeComparison(
+            left_name=swipe_left_layer,
+            right_name=swipe_right_layer,
             orthophoto_tile_url=orthophoto_tile_url,
-            opacity=terrain_opacity,
-            side_label="Left",
-        )
-
-        right_layer = _make_swipe_layer(
-            layer_name=swipe_right_layer,
-            orthophoto_tile_url=orthophoto_tile_url,
-            opacity=terrain_opacity,
-            side_label="Right",
-        )
-
-        left_layer.add_to(terrain_map)
-        right_layer.add_to(terrain_map)
-
-        SideBySideLayers(
-            layer_left=left_layer,
-            layer_right=right_layer,
         ).add_to(terrain_map)
 
     _add_roads(
@@ -636,17 +773,13 @@ def show_terrain_analysis(
         st.error(f"Could not prepare the terrain map: {error}")
         return
 
-    map_result = st_folium(
+    st_folium(
         terrain_map,
         width=None,
         height=720,
-        returned_objects=["last_clicked"],
+        returned_objects=[],
         use_container_width=True,
-        key=(
-            f"terrain_map_{display_mode}_"
-            f"{swipe_left_layer}_{swipe_right_layer}_"
-            f"{terrain_opacity}_{show_orthophoto}"
-        ),
+        key="terrain_analysis_map",
     )
 
     st.markdown("### Terrain information")
@@ -688,20 +821,6 @@ def show_terrain_analysis(
             representation = "Surface comparison"
 
         st.metric("Representation", representation)
-
-    clicked_point = map_result.get("last_clicked")
-
-    if clicked_point:
-        latitude = clicked_point.get("lat")
-        longitude = clicked_point.get("lng")
-
-        if latitude is not None and longitude is not None:
-            st.success(
-                "Selected coordinate: "
-                f"{latitude:.6f}, {longitude:.6f}"
-            )
-    else:
-        st.info("Click the map to inspect a terrain location.")
 
     with st.expander(
         "How to use the terrain comparison",
