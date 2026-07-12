@@ -8,6 +8,7 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 import streamlit as st
+from terrain_analysis import show_terrain_analysis
 from ai_engine import interpret_gis_command
 
 from branca.element import MacroElement
