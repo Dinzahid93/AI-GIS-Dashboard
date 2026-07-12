@@ -12,3 +12,4 @@ scipy
 requests
 pyproj
 google-genai
+rasterio
