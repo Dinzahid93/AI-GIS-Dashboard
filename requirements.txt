@@ -12,3 +12,16 @@ requests
 google-genai
 branca
 jinja2
+streamlit
+streamlit-folium
+folium
+geopandas
+shapely
+networkx
+numpy
+pandas
+scipy
+requests
+pyproj
+pylerc
+google-genai
