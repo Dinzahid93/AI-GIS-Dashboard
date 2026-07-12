@@ -18,7 +18,7 @@ This version keeps the interface clean:
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 import folium
 import streamlit as st
@@ -214,12 +214,126 @@ class TransparentWhiteTileLayer(MacroElement):
         )
 
 
+
+def _existing_fields(
+    geojson_data: Optional[dict[str, Any]],
+    candidates: list[str],
+) -> list[str]:
+    """Return candidate fields that exist in a GeoJSON layer."""
+
+    if not geojson_data:
+        return []
+
+    features = geojson_data.get("features", [])
+
+    if not features:
+        return []
+
+    available_fields: set[str] = set()
+
+    for feature in features[:100]:
+        properties = feature.get("properties", {}) or {}
+        available_fields.update(properties.keys())
+
+    return [
+        field
+        for field in candidates
+        if field in available_fields
+    ]
+
+
+def _add_building_layer(
+    map_object: folium.Map,
+    buildings_geojson: Optional[dict[str, Any]],
+) -> None:
+    """Add building footprints to the map layer control, hidden by default."""
+
+    if not buildings_geojson:
+        return
+
+    tooltip_fields = _existing_fields(
+        buildings_geojson,
+        ["FID", "NAME", "name", "building_name"],
+    )
+
+    tooltip = None
+
+    if tooltip_fields:
+        tooltip = folium.GeoJsonTooltip(
+            fields=tooltip_fields,
+            aliases=[
+                field.replace("_", " ").title() + ":"
+                for field in tooltip_fields
+            ],
+            sticky=True,
+        )
+
+    folium.GeoJson(
+        buildings_geojson,
+        name="Building Footprints",
+        show=False,
+        style_function=lambda feature: {
+            "color": "#F39C12",
+            "weight": 1.2,
+            "fillColor": "#F39C12",
+            "fillOpacity": 0.18,
+        },
+        highlight_function=lambda feature: {
+            "color": "#FFD700",
+            "weight": 3,
+            "fillOpacity": 0.35,
+        },
+        tooltip=tooltip,
+    ).add_to(map_object)
+
+
+def _add_road_layer(
+    map_object: folium.Map,
+    roads_geojson: Optional[dict[str, Any]],
+) -> None:
+    """Add the road network to the map layer control, hidden by default."""
+
+    if not roads_geojson:
+        return
+
+    tooltip_fields = _existing_fields(
+        roads_geojson,
+        ["FID", "NAME", "name", "road_name"],
+    )
+
+    tooltip = None
+
+    if tooltip_fields:
+        tooltip = folium.GeoJsonTooltip(
+            fields=tooltip_fields,
+            aliases=[
+                field.replace("_", " ").title() + ":"
+                for field in tooltip_fields
+            ],
+            sticky=True,
+        )
+
+    folium.GeoJson(
+        roads_geojson,
+        name="Road Network",
+        show=False,
+        style_function=lambda feature: {
+            "color": "#FFC0CB",
+            "weight": 3,
+            "opacity": 0.85,
+        },
+        tooltip=tooltip,
+    ).add_to(map_object)
+
+
 # ============================================================
 # 3. CREATE TERRAIN MAP
 # ============================================================
 
 def create_terrain_map(
     orthophoto_tile_url: Optional[str],
+    buildings_geojson: Optional[dict[str, Any]],
+    roads_geojson: Optional[dict[str, Any]],
     map_center: tuple[float, float],
     zoom_start: int,
 ) -> folium.Map:
@@ -288,6 +402,17 @@ def create_terrain_map(
         max_zoom=23,
     ).add_to(terrain_map)
 
+    # Optional vector overlays, available in the same layer control.
+    _add_road_layer(
+        map_object=terrain_map,
+        roads_geojson=roads_geojson,
+    )
+
+    _add_building_layer(
+        map_object=terrain_map,
+        buildings_geojson=buildings_geojson,
+    )
+
     Fullscreen(
         position="topright",
         title="Full screen",
@@ -333,28 +458,29 @@ def create_terrain_map(
 
 def show_terrain_analysis(
     orthophoto_tile_url: Optional[str] = None,
-    buildings_geojson=None,
-    roads_geojson=None,
+    buildings_geojson: Optional[dict[str, Any]] = None,
+    roads_geojson: Optional[dict[str, Any]] = None,
     map_center: tuple[float, float] = (3.0697, 101.5033),
     zoom_start: int = 16,
 ) -> None:
     """
     Display the simplified Terrain Analysis tab.
 
-    buildings_geojson and roads_geojson remain accepted so the existing
-    app.py call does not need to be changed, but they are intentionally
-    not displayed in this clean terrain interface.
+    Building and road layers are included in the map layer control and
+    remain hidden by default for a clean initial map.
     """
 
     st.subheader("⛰️ Terrain Analysis")
 
     st.caption(
-        "Use the map layer control to switch the orthophoto, DTM and DSM "
-        "on or off."
+        "Use the map layer control to switch the orthophoto, DTM, DSM, "
+        "buildings and road network on or off."
     )
 
     terrain_map = create_terrain_map(
         orthophoto_tile_url=orthophoto_tile_url,
+        buildings_geojson=buildings_geojson,
+        roads_geojson=roads_geojson,
         map_center=map_center,
         zoom_start=zoom_start,
     )
