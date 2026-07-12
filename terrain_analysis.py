@@ -1,23 +1,24 @@
 """
-Simplified Terrain Analysis module for the UiTM Shah Alam GIS dashboard.
+Terrain Analysis module for the UiTM Shah Alam GIS dashboard.
 
-This version keeps the interface clean:
-- One terrain map only
-- OpenStreetMap basemap
-- Orthophoto overlay
-- DTM overlay
-- DSM overlay
-- Layer control for switching layers on and off
-- Fullscreen control
+Features:
+- One stable terrain map
+- Orthophoto, DTM, DSM, buildings and roads in the layer control
+- Terrain GIS Assistant inside the Terrain Analysis tab
+- Natural-language command:
+    "What is the elevation at Building 10?"
+- Actual DTM elevation sampling from data/here.tif
+- Gemini interpretation with a built-in fallback parser
+- No separate terrain_ai.py file required
 - No swipe comparison
 - No opacity slider
-- No building or road toggles
-- No map-click feedback
-- No interaction-based Streamlit reruns
+- No map-click reruns
 """
 
 from __future__ import annotations
 
+import json
+import re
 from typing import Any, Optional
 
 import folium
@@ -25,7 +26,13 @@ import streamlit as st
 from branca.element import MacroElement
 from folium.plugins import Fullscreen
 from jinja2 import Template
+from shapely.geometry import shape
 from streamlit_folium import st_folium
+
+from terrain_engine import (
+    TerrainSamplingError,
+    sample_elevation_wgs84,
+)
 
 
 # ============================================================
@@ -58,9 +65,6 @@ DSM_TILE_URL = (
 class TransparentWhiteTileLayer(MacroElement):
     """
     Display the orthophoto while removing near-white background pixels.
-
-    This matches the orthophoto behaviour already used in the network
-    analysis map.
     """
 
     def __init__(
@@ -214,6 +218,9 @@ class TransparentWhiteTileLayer(MacroElement):
         )
 
 
+# ============================================================
+# 3. GEOJSON HELPERS
+# ============================================================
 
 def _existing_fields(
     geojson_data: Optional[dict[str, Any]],
@@ -242,11 +249,67 @@ def _existing_fields(
     ]
 
 
+def _find_building_feature(
+    buildings_geojson: dict[str, Any],
+    building_id: int,
+) -> dict[str, Any]:
+    """Find a building feature using its FID."""
+
+    for feature in buildings_geojson.get("features", []):
+        properties = feature.get("properties", {}) or {}
+
+        try:
+            feature_id = int(properties.get("FID"))
+        except (TypeError, ValueError):
+            continue
+
+        if feature_id == int(building_id):
+            return feature
+
+    raise ValueError(
+        f"Building {building_id} was not found."
+    )
+
+
+def _building_point_wgs84(
+    buildings_geojson: dict[str, Any],
+    building_id: int,
+) -> tuple[float, float]:
+    """Return one representative longitude/latitude for a building."""
+
+    feature = _find_building_feature(
+        buildings_geojson=buildings_geojson,
+        building_id=building_id,
+    )
+
+    geometry = shape(feature["geometry"])
+    point = geometry.representative_point()
+
+    return float(point.x), float(point.y)
+
+
+def _building_name(
+    buildings_geojson: dict[str, Any],
+    building_id: int,
+) -> str:
+    """Return the NAME value or a fallback building label."""
+
+    feature = _find_building_feature(
+        buildings_geojson=buildings_geojson,
+        building_id=building_id,
+    )
+
+    properties = feature.get("properties", {}) or {}
+    name = str(properties.get("NAME", "")).strip()
+
+    return name if name else f"Building {building_id}"
+
+
 def _add_building_layer(
     map_object: folium.Map,
     buildings_geojson: Optional[dict[str, Any]],
 ) -> None:
-    """Add building footprints to the map layer control, hidden by default."""
+    """Add building footprints, hidden by default."""
 
     if not buildings_geojson:
         return
@@ -291,7 +354,7 @@ def _add_road_layer(
     map_object: folium.Map,
     roads_geojson: Optional[dict[str, Any]],
 ) -> None:
-    """Add the road network to the map layer control, hidden by default."""
+    """Add the road network, hidden by default."""
 
     if not roads_geojson:
         return
@@ -327,7 +390,168 @@ def _add_road_layer(
 
 
 # ============================================================
-# 3. CREATE TERRAIN MAP
+# 4. TERRAIN COMMAND INTERPRETER
+# ============================================================
+
+def _fallback_parse_terrain_command(
+    question: str,
+) -> dict[str, Any]:
+    """
+    Parse the supported terrain request without Gemini.
+
+    Supported request:
+        What is the elevation at Building 10?
+    """
+
+    text = question.lower().strip()
+
+    building_match = re.search(
+        r"building\s*(\d+)",
+        text,
+    )
+
+    terrain_words = [
+        "elevation",
+        "height",
+        "ground level",
+        "terrain level",
+        "altitude",
+    ]
+
+    if (
+        building_match is not None
+        and any(word in text for word in terrain_words)
+    ):
+        building_id = int(building_match.group(1))
+
+        return {
+            "action": "building_elevation",
+            "building_id": building_id,
+            "reply": (
+                f"Retrieving the DTM ground elevation "
+                f"for Building {building_id}."
+            ),
+            "interpreter": "Built-in terrain parser",
+        }
+
+    return {
+        "action": "unknown",
+        "reply": (
+            "Try a request such as: "
+            "'What is the elevation at Building 10?'"
+        ),
+        "interpreter": "Built-in terrain parser",
+    }
+
+
+def _extract_json_object(
+    response_text: str,
+) -> dict[str, Any]:
+    """Extract one JSON object from a Gemini response."""
+
+    cleaned = response_text.strip()
+
+    if cleaned.startswith("```"):
+        cleaned = re.sub(
+            r"^```(?:json)?\s*",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(
+            r"\s*```$",
+            "",
+            cleaned,
+        )
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+
+    if start == -1 or end == -1:
+        raise ValueError(
+            "Gemini did not return a JSON object."
+        )
+
+    return json.loads(
+        cleaned[start : end + 1]
+    )
+
+
+def interpret_terrain_command(
+    question: str,
+    api_key: str,
+    model_name: str,
+) -> dict[str, Any]:
+    """
+    Interpret a terrain request with Gemini.
+
+    The GIS engine still performs the real elevation calculation.
+    """
+
+    if not api_key:
+        return _fallback_parse_terrain_command(question)
+
+    try:
+        from google import genai
+
+        client = genai.Client(api_key=api_key)
+
+        prompt = f"""
+You are a GIS command interpreter for a terrain-analysis dashboard.
+
+The dashboard currently supports only one action:
+
+building_elevation
+
+Return JSON only in this exact structure:
+{{
+  "action": "building_elevation",
+  "building_id": 10,
+  "reply": "Retrieving the DTM ground elevation for Building 10."
+}}
+
+Rules:
+- Extract the building number exactly.
+- Do not calculate or invent elevation values.
+- If the request is unsupported, return:
+{{
+  "action": "unknown",
+  "reply": "The terrain request is not supported."
+}}
+
+User request:
+{question}
+"""
+
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config={
+                "response_mime_type": "application/json",
+            },
+        )
+
+        parsed = _extract_json_object(
+            str(response.text)
+        )
+
+        if parsed.get("action") not in {
+            "building_elevation",
+            "unknown",
+        }:
+            raise ValueError(
+                "Gemini returned an unsupported action."
+            )
+
+        parsed["interpreter"] = "Gemini"
+
+        return parsed
+
+    except Exception:
+        return _fallback_parse_terrain_command(question)
+
+
+# ============================================================
+# 5. CREATE TERRAIN MAP
 # ============================================================
 
 def create_terrain_map(
@@ -337,11 +561,7 @@ def create_terrain_map(
     map_center: tuple[float, float],
     zoom_start: int,
 ) -> folium.Map:
-    """
-    Create one stable terrain map containing Orthophoto, DTM and DSM.
-
-    Users control visibility directly from the Folium layer control.
-    """
+    """Create one stable terrain map."""
 
     terrain_map = folium.Map(
         location=list(map_center),
@@ -352,7 +572,6 @@ def create_terrain_map(
         prefer_canvas=True,
     )
 
-    # Base map
     folium.TileLayer(
         tiles="OpenStreetMap",
         name="OpenStreetMap",
@@ -362,7 +581,6 @@ def create_terrain_map(
         max_zoom=23,
     ).add_to(terrain_map)
 
-    # Orthophoto overlay
     orthophoto_layer = None
 
     if orthophoto_tile_url:
@@ -376,7 +594,6 @@ def create_terrain_map(
 
         orthophoto_layer.add_to(terrain_map)
 
-    # DTM overlay
     folium.TileLayer(
         tiles=DTM_TILE_URL,
         name="Digital Terrain Model",
@@ -389,7 +606,6 @@ def create_terrain_map(
         max_zoom=23,
     ).add_to(terrain_map)
 
-    # DSM overlay
     folium.TileLayer(
         tiles=DSM_TILE_URL,
         name="Digital Surface Model",
@@ -402,7 +618,6 @@ def create_terrain_map(
         max_zoom=23,
     ).add_to(terrain_map)
 
-    # Optional vector overlays, available in the same layer control.
     _add_road_layer(
         map_object=terrain_map,
         roads_geojson=roads_geojson,
@@ -427,7 +642,6 @@ def create_terrain_map(
 
     layer_control.add_to(terrain_map)
 
-    # Register the custom orthophoto layer in the normal layer control.
     if orthophoto_layer is not None:
         terrain_map.get_root().script.add_child(
             folium.Element(
@@ -453,7 +667,7 @@ def create_terrain_map(
 
 
 # ============================================================
-# 4. STREAMLIT TERRAIN TAB
+# 6. STREAMLIT TERRAIN TAB
 # ============================================================
 
 def show_terrain_analysis(
@@ -464,13 +678,209 @@ def show_terrain_analysis(
     zoom_start: int = 16,
 ) -> None:
     """
-    Display the simplified Terrain Analysis tab.
-
-    Building and road layers are included in the map layer control and
-    remain hidden by default for a clean initial map.
+    Display the Terrain Analysis tab with one LLM-enabled elevation command.
     """
 
+    if "terrain_elevation_result" not in st.session_state:
+        st.session_state.terrain_elevation_result = None
+
+    if "terrain_last_question" not in st.session_state:
+        st.session_state.terrain_last_question = ""
+
+    if "terrain_last_interpreter" not in st.session_state:
+        st.session_state.terrain_last_interpreter = ""
+
     st.subheader("⛰️ Terrain Analysis")
+
+    st.caption(
+        "Use natural language to retrieve ground elevation from the DTM, "
+        "or use the map layer control to view the orthophoto, DTM, DSM, "
+        "buildings and road network."
+    )
+
+    # --------------------------------------------------------
+    # TERRAIN GIS ASSISTANT
+    # --------------------------------------------------------
+
+    st.markdown("### Terrain GIS Assistant")
+
+    with st.form(
+        key="terrain_gis_assistant_form",
+        clear_on_submit=False,
+    ):
+        terrain_question = st.text_input(
+            "Enter a terrain GIS request",
+            value=st.session_state.terrain_last_question,
+            placeholder=(
+                "Example: What is the elevation at Building 10?"
+            ),
+        )
+
+        with st.expander(
+            "Example terrain command",
+            expanded=False,
+        ):
+            st.code(
+                "What is the elevation at Building 10?"
+            )
+
+        run_col, clear_col = st.columns([3, 1])
+
+        with run_col:
+            terrain_submitted = st.form_submit_button(
+                "▶ Run Terrain Analysis",
+                type="primary",
+                use_container_width=True,
+            )
+
+        with clear_col:
+            terrain_clear = st.form_submit_button(
+                "🗑️ Clear",
+                use_container_width=True,
+            )
+
+    if terrain_clear:
+        st.session_state.terrain_elevation_result = None
+        st.session_state.terrain_last_question = ""
+        st.session_state.terrain_last_interpreter = ""
+        st.rerun()
+
+    if terrain_submitted:
+        st.session_state.terrain_last_question = terrain_question
+
+        if not terrain_question.strip():
+            st.warning(
+                "Please enter a terrain GIS request."
+            )
+
+        elif buildings_geojson is None:
+            st.error(
+                "Building data are unavailable."
+            )
+
+        else:
+            try:
+                api_key = str(
+                    st.secrets.get(
+                        "GEMINI_API_KEY",
+                        "",
+                    )
+                ).strip()
+
+                model_name = str(
+                    st.secrets.get(
+                        "GEMINI_MODEL",
+                        "gemini-2.5-flash-lite",
+                    )
+                ).strip()
+
+                parsed = interpret_terrain_command(
+                    question=terrain_question,
+                    api_key=api_key,
+                    model_name=model_name,
+                )
+
+                st.session_state.terrain_last_interpreter = str(
+                    parsed.get("interpreter", "")
+                )
+
+                if parsed.get("reply"):
+                    st.info(parsed["reply"])
+
+                if parsed.get("action") == "building_elevation":
+                    building_id = int(
+                        parsed["building_id"]
+                    )
+
+                    longitude, latitude = _building_point_wgs84(
+                        buildings_geojson=buildings_geojson,
+                        building_id=building_id,
+                    )
+
+                    with st.spinner(
+                        "Reading the DTM elevation value..."
+                    ):
+                        elevation = sample_elevation_wgs84(
+                            longitude=longitude,
+                            latitude=latitude,
+                        )
+
+                    st.session_state.terrain_elevation_result = {
+                        "building_id": building_id,
+                        "building_name": _building_name(
+                            buildings_geojson,
+                            building_id,
+                        ),
+                        "longitude": longitude,
+                        "latitude": latitude,
+                        "elevation_m": float(elevation),
+                    }
+
+                else:
+                    st.warning(
+                        parsed.get(
+                            "reply",
+                            "The terrain request is not supported.",
+                        )
+                    )
+
+            except TerrainSamplingError as error:
+                st.error(
+                    f"Could not retrieve elevation: {error}"
+                )
+
+            except Exception as error:
+                st.error(
+                    f"Terrain analysis failed: {error}"
+                )
+
+    if st.session_state.terrain_last_interpreter:
+        st.caption(
+            "Last terrain interpreter used: "
+            f"{st.session_state.terrain_last_interpreter}"
+        )
+
+    # --------------------------------------------------------
+    # ELEVATION RESULT
+    # --------------------------------------------------------
+
+    result = st.session_state.terrain_elevation_result
+
+    if result:
+        st.markdown("### Elevation result")
+
+        metric_col1, metric_col2 = st.columns([2, 1])
+
+        with metric_col1:
+            st.metric(
+                label=(
+                    f"Ground elevation at "
+                    f"Building {result['building_id']}"
+                ),
+                value=f"{result['elevation_m']:.2f} m",
+            )
+
+        with metric_col2:
+            st.metric(
+                label="Building ID",
+                value=str(result["building_id"]),
+            )
+
+        st.caption(
+            f"Building name: {result['building_name']}"
+        )
+
+        st.caption(
+            "Sample coordinate: "
+            f"{result['latitude']:.6f}, "
+            f"{result['longitude']:.6f}"
+        )
+
+    # --------------------------------------------------------
+    # TERRAIN MAP
+    # --------------------------------------------------------
+
+    st.markdown("### Terrain map")
 
     st.caption(
         "Use the map layer control to switch the orthophoto, DTM, DSM, "
@@ -504,7 +914,8 @@ def show_terrain_analysis(
             Shows the visible campus surface captured by the UAV camera.
 
             **Digital Terrain Model (DTM)**  
-            Represents the approximate bare-earth ground surface.
+            Represents the approximate bare-earth ground surface. Elevation
+            values are retrieved from `data/here.tif` and reported in metres.
 
             **Digital Surface Model (DSM)**  
             Represents the upper visible surface, including buildings,
