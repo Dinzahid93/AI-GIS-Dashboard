@@ -1,32 +1,36 @@
 """
-Terrain Analysis module for the UiTM Shah Alam GIS dashboard.
+Simplified Terrain Analysis module for the UiTM Shah Alam GIS dashboard.
 
-This module displays the ArcGIS Online DTM and DSM tile services in a
-separate Streamlit tab. It supports:
-- DTM display
-- DSM display
-- DTM and DSM layer switching
-- DTM versus DSM swipe comparison
-- Orthophoto on/off
-- Terrain opacity
-- Building and road overlays
-- Fullscreen and layer controls
-
-The published MapServer layers are visual tile layers. Numeric pixel
-elevation queries require the original GeoTIFF or an ImageServer service.
+This version keeps the interface clean:
+- One terrain map only
+- OpenStreetMap basemap
+- Orthophoto overlay
+- DTM overlay
+- DSM overlay
+- Layer control for switching layers on and off
+- Fullscreen control
+- No swipe comparison
+- No opacity slider
+- No building or road toggles
+- No map-click feedback
+- No interaction-based Streamlit reruns
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Optional
 
 import folium
 import streamlit as st
 from branca.element import MacroElement
-from folium.plugins import Fullscreen, MousePosition, SideBySideLayers
+from folium.plugins import Fullscreen
 from jinja2 import Template
 from streamlit_folium import st_folium
 
+
+# ============================================================
+# 1. ARCGIS ONLINE SERVICES
+# ============================================================
 
 DTM_SERVICE_URL = (
     "https://tiles.arcgis.com/tiles/2ZRAaoTSJbQ20ceg/"
@@ -38,12 +42,26 @@ DSM_SERVICE_URL = (
     "arcgis/rest/services/DSM_UiTM_Shah_Alam/MapServer"
 )
 
-DTM_TILE_URL = f"{DTM_SERVICE_URL}/tile/{{z}}/{{y}}/{{x}}"
-DSM_TILE_URL = f"{DSM_SERVICE_URL}/tile/{{z}}/{{y}}/{{x}}"
+DTM_TILE_URL = (
+    f"{DTM_SERVICE_URL}/tile/{{z}}/{{y}}/{{x}}"
+)
 
+DSM_TILE_URL = (
+    f"{DSM_SERVICE_URL}/tile/{{z}}/{{y}}/{{x}}"
+)
+
+
+# ============================================================
+# 2. TRANSPARENT ORTHOPHOTO LAYER
+# ============================================================
 
 class TransparentWhiteTileLayer(MacroElement):
-    """Remove near-white pixels from the orthophoto tiles."""
+    """
+    Display the orthophoto while removing near-white background pixels.
+
+    This matches the orthophoto behaviour already used in the network
+    analysis map.
+    """
 
     def __init__(
         self,
@@ -66,9 +84,14 @@ class TransparentWhiteTileLayer(MacroElement):
             """
             {% macro script(this, kwargs) %}
 
-            var {{ this.get_name() }}Class = L.GridLayer.extend({
+            var {{ this.get_name() }}Class =
+                L.GridLayer.extend({
+
                 createTile: function(coords, done) {
-                    var tile = document.createElement("canvas");
+
+                    var tile =
+                        document.createElement("canvas");
+
                     var size = this.getTileSize();
 
                     tile.width = size.x;
@@ -82,12 +105,14 @@ class TransparentWhiteTileLayer(MacroElement):
                     var image = new Image();
                     image.crossOrigin = "anonymous";
 
-                    var tileUrl = "{{ this.tile_url }}"
+                    var tileUrl =
+                        "{{ this.tile_url }}"
                         .replace("{z}", coords.z)
                         .replace("{x}", coords.x)
                         .replace("{y}", coords.y);
 
                     image.onload = function() {
+
                         try {
                             context.drawImage(
                                 image,
@@ -97,15 +122,17 @@ class TransparentWhiteTileLayer(MacroElement):
                                 size.y
                             );
 
-                            var imageData = context.getImageData(
-                                0,
-                                0,
-                                size.x,
-                                size.y
-                            );
+                            var imageData =
+                                context.getImageData(
+                                    0,
+                                    0,
+                                    size.x,
+                                    size.y
+                                );
 
                             var pixels = imageData.data;
-                            var threshold = {{ this.white_threshold }};
+                            var threshold =
+                                {{ this.white_threshold }};
 
                             for (
                                 var i = 0;
@@ -126,12 +153,20 @@ class TransparentWhiteTileLayer(MacroElement):
                                     Math.abs(red - blue) < 8 &&
                                     Math.abs(green - blue) < 8;
 
-                                if (nearWhite && similarValues) {
+                                if (
+                                    nearWhite &&
+                                    similarValues
+                                ) {
                                     pixels[i + 3] = 0;
                                 }
                             }
 
-                            context.putImageData(imageData, 0, 0);
+                            context.putImageData(
+                                imageData,
+                                0,
+                                0
+                            );
+
                             done(null, tile);
 
                         } catch (error) {
@@ -142,6 +177,7 @@ class TransparentWhiteTileLayer(MacroElement):
                                 size.x,
                                 size.y
                             );
+
                             done(null, tile);
                         }
                     };
@@ -151,17 +187,22 @@ class TransparentWhiteTileLayer(MacroElement):
                     };
 
                     image.src = tileUrl;
+
                     return tile;
                 }
             });
 
             var {{ this.get_name() }}_layer =
                 new {{ this.get_name() }}Class({
+
                     tileSize: 256,
                     opacity: {{ this.opacity }},
                     maxZoom: {{ this.max_zoom }},
-                    maxNativeZoom: {{ this.max_native_zoom }},
-                    attribution: "UiTM Shah Alam UAV Orthomosaic"
+                    maxNativeZoom:
+                        {{ this.max_native_zoom }},
+
+                    attribution:
+                        "UiTM Shah Alam UAV Orthomosaic"
                 });
 
             {{ this.get_name() }}_layer.addTo(
@@ -173,125 +214,20 @@ class TransparentWhiteTileLayer(MacroElement):
         )
 
 
-def _existing_fields(
-    geojson_data: Optional[dict[str, Any]],
-    candidates: list[str],
-) -> list[str]:
-    """Return candidate fields that exist in the GeoJSON properties."""
-
-    if not geojson_data:
-        return []
-
-    features = geojson_data.get("features", [])
-    if not features:
-        return []
-
-    available_fields: set[str] = set()
-
-    for feature in features[:100]:
-        properties = feature.get("properties", {}) or {}
-        available_fields.update(properties.keys())
-
-    return [
-        field
-        for field in candidates
-        if field in available_fields
-    ]
-
-
-def _add_buildings(
-    map_object: folium.Map,
-    buildings_geojson: Optional[dict[str, Any]],
-    show: bool,
-) -> None:
-    if not buildings_geojson:
-        return
-
-    tooltip_fields = _existing_fields(
-        buildings_geojson,
-        ["FID", "NAME", "name", "building_name"],
-    )
-
-    tooltip = None
-    if tooltip_fields:
-        tooltip = folium.GeoJsonTooltip(
-            fields=tooltip_fields,
-            aliases=[
-                field.replace("_", " ").title() + ":"
-                for field in tooltip_fields
-            ],
-            sticky=True,
-        )
-
-    folium.GeoJson(
-        buildings_geojson,
-        name="Building Footprints",
-        show=show,
-        style_function=lambda feature: {
-            "color": "#F39C12",
-            "weight": 1.2,
-            "fillColor": "#F39C12",
-            "fillOpacity": 0.18,
-        },
-        highlight_function=lambda feature: {
-            "color": "#FFD700",
-            "weight": 3,
-            "fillOpacity": 0.38,
-        },
-        tooltip=tooltip,
-    ).add_to(map_object)
-
-
-def _add_roads(
-    map_object: folium.Map,
-    roads_geojson: Optional[dict[str, Any]],
-    show: bool,
-) -> None:
-    if not roads_geojson:
-        return
-
-    tooltip_fields = _existing_fields(
-        roads_geojson,
-        ["FID", "NAME", "name", "road_name"],
-    )
-
-    tooltip = None
-    if tooltip_fields:
-        tooltip = folium.GeoJsonTooltip(
-            fields=tooltip_fields,
-            aliases=[
-                field.replace("_", " ").title() + ":"
-                for field in tooltip_fields
-            ],
-            sticky=True,
-        )
-
-    folium.GeoJson(
-        roads_geojson,
-        name="Road Network",
-        show=show,
-        style_function=lambda feature: {
-            "color": "#FFC0CB",
-            "weight": 3,
-            "opacity": 0.85,
-        },
-        tooltip=tooltip,
-    ).add_to(map_object)
-
+# ============================================================
+# 3. CREATE TERRAIN MAP
+# ============================================================
 
 def create_terrain_map(
-    display_mode: str,
-    terrain_opacity: float,
-    show_orthophoto: bool,
-    show_buildings: bool,
-    show_roads: bool,
     orthophoto_tile_url: Optional[str],
-    buildings_geojson: Optional[dict[str, Any]],
-    roads_geojson: Optional[dict[str, Any]],
     map_center: tuple[float, float],
     zoom_start: int,
 ) -> folium.Map:
-    """Build the terrain visualisation or selectable swipe map."""
+    """
+    Create one stable terrain map containing Orthophoto, DTM and DSM.
+
+    Users control visibility directly from the Folium layer control.
+    """
 
     terrain_map = folium.Map(
         location=list(map_center),
@@ -302,6 +238,7 @@ def create_terrain_map(
         prefer_canvas=True,
     )
 
+    # Base map
     folium.TileLayer(
         tiles="OpenStreetMap",
         name="OpenStreetMap",
@@ -311,16 +248,10 @@ def create_terrain_map(
         max_zoom=23,
     ).add_to(terrain_map)
 
+    # Orthophoto overlay
     orthophoto_layer = None
 
-    # In normal terrain display, add the custom transparent orthophoto.
-    # In swipe display, the selected orthophoto is inserted into the
-    # SideBySideLayers control instead.
-    if (
-        display_mode != "Swipe comparison"
-        and orthophoto_tile_url
-        and show_orthophoto
-    ):
+    if orthophoto_tile_url:
         orthophoto_layer = TransparentWhiteTileLayer(
             tile_url=orthophoto_tile_url,
             white_threshold=245,
@@ -328,71 +259,34 @@ def create_terrain_map(
             max_native_zoom=20,
             max_zoom=23,
         )
+
         orthophoto_layer.add_to(terrain_map)
 
-    if display_mode == "DTM":
-        folium.TileLayer(
-            tiles=DTM_TILE_URL,
-            name="Digital Terrain Model",
-            attr="UiTM Shah Alam DTM",
-            overlay=True,
-            control=True,
-            show=True,
-            opacity=terrain_opacity,
-            max_native_zoom=20,
-            max_zoom=23,
-        ).add_to(terrain_map)
+    # DTM overlay
+    folium.TileLayer(
+        tiles=DTM_TILE_URL,
+        name="Digital Terrain Model",
+        attr="UiTM Shah Alam DTM",
+        overlay=True,
+        control=True,
+        show=False,
+        opacity=1.0,
+        max_native_zoom=20,
+        max_zoom=23,
+    ).add_to(terrain_map)
 
-    elif display_mode == "DSM":
-        folium.TileLayer(
-            tiles=DSM_TILE_URL,
-            name="Digital Surface Model",
-            attr="UiTM Shah Alam DSM",
-            overlay=True,
-            control=True,
-            show=True,
-            opacity=terrain_opacity,
-            max_native_zoom=20,
-            max_zoom=23,
-        ).add_to(terrain_map)
-
-    elif display_mode == "DTM and DSM":
-        folium.TileLayer(
-            tiles=DTM_TILE_URL,
-            name="Digital Terrain Model",
-            attr="UiTM Shah Alam DTM",
-            overlay=True,
-            control=True,
-            show=True,
-            opacity=terrain_opacity,
-            max_native_zoom=20,
-            max_zoom=23,
-        ).add_to(terrain_map)
-
-        folium.TileLayer(
-            tiles=DSM_TILE_URL,
-            name="Digital Surface Model",
-            attr="UiTM Shah Alam DSM",
-            overlay=True,
-            control=True,
-            show=False,
-            opacity=terrain_opacity,
-            max_native_zoom=20,
-            max_zoom=23,
-        ).add_to(terrain_map)
-
-
-    _add_roads(
-        map_object=terrain_map,
-        roads_geojson=roads_geojson,
-        show=show_roads,
-    )
-
-    _add_buildings(
-        map_object=terrain_map,
-        buildings_geojson=buildings_geojson,
-        show=show_buildings,
-    )
+    # DSM overlay
+    folium.TileLayer(
+        tiles=DSM_TILE_URL,
+        name="Digital Surface Model",
+        attr="UiTM Shah Alam DSM",
+        overlay=True,
+        control=True,
+        show=False,
+        opacity=1.0,
+        max_native_zoom=20,
+        max_zoom=23,
+    ).add_to(terrain_map)
 
     Fullscreen(
         position="topright",
@@ -401,19 +295,14 @@ def create_terrain_map(
         force_separate_button=True,
     ).add_to(terrain_map)
 
-    MousePosition(
-        position="bottomright",
-        separator=" | ",
-        prefix="Coordinate:",
-        num_digits=6,
-    ).add_to(terrain_map)
-
     layer_control = folium.LayerControl(
         collapsed=False,
         position="topleft",
     )
+
     layer_control.add_to(terrain_map)
 
+    # Register the custom orthophoto layer in the normal layer control.
     if orthophoto_layer is not None:
         terrain_map.get_root().script.add_child(
             folium.Element(
@@ -422,11 +311,11 @@ def create_terrain_map(
                     try {{
                         {layer_control.get_name()}.addOverlay(
                             {orthophoto_layer.get_name()}_layer,
-                            "UiTM Shah Alam Orthomosaic"
+                            "UiTM Shah Alam Orthophoto"
                         );
                     }} catch (error) {{
                         console.log(
-                            "Orthomosaic control registration:",
+                            "Orthophoto layer registration:",
                             error
                         );
                     }}
@@ -438,61 +327,37 @@ def create_terrain_map(
     return terrain_map
 
 
+# ============================================================
+# 4. STREAMLIT TERRAIN TAB
+# ============================================================
+
 def show_terrain_analysis(
     orthophoto_tile_url: Optional[str] = None,
-    buildings_geojson: Optional[dict[str, Any]] = None,
-    roads_geojson: Optional[dict[str, Any]] = None,
+    buildings_geojson=None,
+    roads_geojson=None,
     map_center: tuple[float, float] = (3.0697, 101.5033),
     zoom_start: int = 16,
 ) -> None:
-    """Render the complete terrain-analysis Streamlit interface."""
+    """
+    Display the simplified Terrain Analysis tab.
+
+    buildings_geojson and roads_geojson remain accepted so the existing
+    app.py call does not need to be changed, but they are intentionally
+    not displayed in this clean terrain interface.
+    """
 
     st.subheader("⛰️ Terrain Analysis")
 
     st.caption(
-        "Visualise the DTM and DSM, or select any two available raster "
-        "layers for an interactive swipe comparison."
+        "Use the map layer control to switch the orthophoto, DTM and DSM "
+        "on or off."
     )
 
-    control_col1 = st.container()
-
-    with control_col1:
-        display_mode = st.selectbox(
-            "Terrain display",
-            options=[
-                "DTM",
-                "DSM",
-                "DTM and DSM",
-            ],
-            index=0,
-            key="terrain_display_mode",
-        )
-
-    terrain_opacity = 1.0
-
-
-    show_orthophoto = True
-    show_buildings = False
-    show_roads = False
-
-
-    try:
-        terrain_map = create_terrain_map(
-            display_mode=display_mode,
-            terrain_opacity=terrain_opacity,
-            show_orthophoto=show_orthophoto,
-            show_buildings=show_buildings,
-            show_roads=show_roads,
-            orthophoto_tile_url=orthophoto_tile_url,
-            buildings_geojson=buildings_geojson,
-            roads_geojson=roads_geojson,
-            map_center=map_center,
-            zoom_start=zoom_start,
-        )
-
-    except Exception as error:
-        st.error(f"Could not prepare the terrain map: {error}")
-        return
+    terrain_map = create_terrain_map(
+        orthophoto_tile_url=orthophoto_tile_url,
+        map_center=map_center,
+        zoom_start=zoom_start,
+    )
 
     st_folium(
         terrain_map,
@@ -500,58 +365,23 @@ def show_terrain_analysis(
         height=720,
         returned_objects=[],
         use_container_width=True,
-        key=f"terrain_map_{display_mode}",
+        key="terrain_analysis_map",
     )
 
-    st.markdown("### Terrain information")
-
-    metric_col1, metric_col2, metric_col3 = st.columns(3)
-
-    with metric_col1:
-        st.metric(
-            "Selected display",
-            display_mode,
-        )
-
-    with metric_col2:
-        st.metric(
-            "Layer mode",
-            "Single display",
-        )
-
-    with metric_col3:
-        if display_mode == "DTM":
-            representation = "Bare-earth terrain"
-        elif display_mode == "DSM":
-            representation = "Ground and objects"
-        else:
-            representation = "Surface comparison"
-
-        st.metric("Representation", representation)
-
     with st.expander(
-        "How to interpret DTM and DSM",
+        "How to interpret the terrain layers",
         expanded=False,
     ):
         st.markdown(
             """
+            **Orthophoto**  
+            Shows the visible campus surface captured by the UAV camera.
+
             **Digital Terrain Model (DTM)**  
             Represents the approximate bare-earth ground surface.
 
             **Digital Surface Model (DSM)**  
             Represents the upper visible surface, including buildings,
             vegetation and other above-ground objects.
-
-            **DTM and DSM**  
-            Both layers are available in the map layer control. Switch
-            between them to compare the ground and surface representations.
             """
         )
-
-    st.warning(
-        "These ArcGIS services are pre-rendered map tiles. They support "
-        "visualisation and comparison, but not direct retrieval of the "
-        "original elevation value. Slope, aspect, hillshade and DSM minus "
-        "DTM should be generated from the source rasters and published as "
-        "additional layers."
-    )
