@@ -22,7 +22,7 @@ from typing import Any, Optional
 
 import folium
 import streamlit as st
-from branca.element import MacroElement
+from branca.element import JavascriptLink, MacroElement
 from folium.plugins import Fullscreen, MousePosition
 from jinja2 import Template
 from streamlit_folium import st_folium
@@ -433,14 +433,6 @@ class TransparentSwipeComparison(MacroElement):
         """
     )
 
-    default_js = [
-        (
-            "leaflet-side-by-side",
-            "https://cdn.jsdelivr.net/npm/"
-            "leaflet-side-by-side@2.2.0/"
-            "leaflet-side-by-side.min.js",
-        )
-    ]
 
     def __init__(
         self,
@@ -505,6 +497,16 @@ def create_terrain_map(
         max_zoom=23,
         control_scale=True,
         prefer_canvas=True,
+    )
+
+    # Load the swipe-control JavaScript explicitly. MacroElement.default_js
+    # is not automatically loaded unless the class uses Folium's JSCSSMixin.
+    terrain_map.get_root().header.add_child(
+        JavascriptLink(
+            "https://cdn.jsdelivr.net/npm/"
+            "leaflet-side-by-side@2.2.0/"
+            "leaflet-side-by-side.min.js"
+        )
     )
 
     folium.TileLayer(
@@ -779,7 +781,7 @@ def show_terrain_analysis(
         height=720,
         returned_objects=[],
         use_container_width=True,
-        key="terrain_analysis_map",
+        key=f"terrain_analysis_map_{display_mode}_{swipe_left_layer}_{swipe_right_layer}",
     )
 
     st.markdown("### Terrain information")
