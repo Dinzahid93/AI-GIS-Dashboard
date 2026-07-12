@@ -11,5 +11,4 @@ pandas
 scipy
 requests
 pyproj
-pylerc
 google-genai
